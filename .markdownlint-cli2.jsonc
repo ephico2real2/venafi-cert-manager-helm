@@ -9,6 +9,6 @@
   },
   // Lint the maintained docs (root + chart READMEs + steps.md design notes);
   // ignore the raw Untitled-* scratch dump and tooling.
-  "globs": ["README.md", "steps.md", "charts/**/*.md"],
+  "globs": ["README.md", "steps.md", "charts/**/*.md", "scripts/**/*.md"],
   "ignores": ["**/node_modules/**"]
 }
