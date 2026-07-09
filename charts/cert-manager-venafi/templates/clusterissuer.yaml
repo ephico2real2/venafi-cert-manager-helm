@@ -1,0 +1,37 @@
+{{- if .Values.clusterIssuer.enabled }}
+# Shared Venafi TPP ClusterIssuer. Tenants request certificates by referencing
+# this issuer from a Certificate resource (see the venafi-certificate-sample
+# chart) and never touch TPP credentials directly.
+#
+# Requires the cert-manager.io CRDs installed by the operator. With
+# verifyJob.enabled=true this is a post-install/post-upgrade hook at weight 10,
+# so Helm creates it only after the verification Job (weight 5) exits 0 —
+# guaranteeing the CRDs exist. With verifyJob.enabled=false it is a plain
+# resource (install after the operator is Ready).
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: {{ .Values.clusterIssuer.name }}
+  labels:
+    {{- include "cert-manager-venafi.labels" . | nindent 4 }}
+  {{- if .Values.verifyJob.enabled }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "10"
+    "helm.sh/hook-delete-policy": before-hook-creation
+  {{- end }}
+spec:
+  venafi:
+    zone: {{ .Values.clusterIssuer.venafi.zone | quote }}
+    tpp:
+      url: {{ .Values.clusterIssuer.venafi.tpp.url | quote }}
+      {{- if .Values.clusterIssuer.venafi.tpp.caBundleSecretRef.enabled }}
+      # Explicit CA bundle. Omitted by default — cert-manager trusts the TPP
+      # endpoint via the operator's injected trusted-CA bundle instead.
+      caBundleSecretRef:
+        name: {{ .Values.tppCABundle.secretName }}
+        key: {{ .Values.tppCABundle.key }}
+      {{- end }}
+      credentialsRef:
+        name: {{ .Values.tppCredentials.secretName }}
+{{- end }}

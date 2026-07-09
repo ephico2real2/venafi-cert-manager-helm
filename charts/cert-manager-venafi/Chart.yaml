@@ -1,0 +1,19 @@
+apiVersion: v2
+name: cert-manager-venafi
+description: >-
+  Installs the cert-manager Operator for Red Hat OpenShift, injects a custom CA
+  bundle, provisions the TPP credential/CA secrets, and configures a Venafi TPP
+  ClusterIssuer for issuing certificates from a shared PKI.
+type: application
+version: 0.1.0
+# appVersion tracks the cert-manager operator channel this chart targets.
+appVersion: "stable-v1"
+keywords:
+  - cert-manager
+  - venafi
+  - tpp
+  - openshift
+  - pki
+maintainers:
+  - name: Platform Engineering
+home: https://docs.openshift.com/container-platform/latest/security/cert_manager_operator/index.html

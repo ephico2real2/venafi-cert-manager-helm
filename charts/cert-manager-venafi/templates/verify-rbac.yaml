@@ -1,0 +1,56 @@
+{{- if and .Values.verifyJob.enabled .Values.verifyJob.rbac.create }}
+# Read-only RBAC for the operator-readiness verification Job. Created as an
+# early-weight hook so it exists before the Job (weight 5) runs, and persists
+# across upgrades (before-hook-creation recreates it idempotently).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-verify
+  namespace: {{ .Values.namespaces.operator }}
+  labels:
+    {{- include "cert-manager-venafi.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-verify
+  labels:
+    {{- include "cert-manager-venafi.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation
+rules:
+  - apiGroups: ["operators.coreos.com"]
+    resources: ["subscriptions", "clusterserviceversions"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-verify
+  labels:
+    {{- include "cert-manager-venafi.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Name }}-verify
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-verify
+    namespace: {{ .Values.namespaces.operator }}
+{{- end }}

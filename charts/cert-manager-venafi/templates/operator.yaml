@@ -1,0 +1,31 @@
+{{- if .Values.operator.enabled }}
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: cert-manager-operator
+  namespace: {{ .Values.namespaces.operator }}
+  labels:
+    {{- include "cert-manager-venafi.labels" . | nindent 4 }}
+spec:
+  upgradeStrategy: {{ .Values.operator.upgradeStrategy }}
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: {{ .Values.operator.packageName }}
+  namespace: {{ .Values.namespaces.operator }}
+  labels:
+    {{- include "cert-manager-venafi.labels" . | nindent 4 }}
+spec:
+  channel: {{ .Values.operator.channel }}
+  installPlanApproval: {{ .Values.operator.installPlanApproval }}
+  name: {{ .Values.operator.packageName }}
+  source: {{ .Values.operator.source }}
+  sourceNamespace: {{ .Values.operator.sourceNamespace }}
+  {{- if .Values.trustedCA.enabled }}
+  config:
+    env:
+      - name: TRUSTED_CA_CONFIGMAP_NAME
+        value: {{ .Values.trustedCA.configMapName }}
+  {{- end }}
+{{- end }}

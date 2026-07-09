@@ -1,0 +1,18 @@
+Certificate "{{ .Values.certificate.name }}" requested in namespace {{ .Values.namespace.name }}
+from ClusterIssuer "{{ .Values.issuerRef.name }}".
+
+Verify issuance:
+
+  oc -n {{ .Values.namespace.name }} get certificate {{ .Values.certificate.name }}
+  # READY should become True with Not Before / Not After populated.
+
+  oc -n {{ .Values.namespace.name }} describe certificate {{ .Values.certificate.name }}
+  # Events flow: Requested -> Issuing -> Issued
+
+  oc -n {{ .Values.namespace.name }} get secret {{ .Values.certificate.secretName }}
+  # Contains tls.crt, tls.key, ca.crt
+
+Inspect the issued certificate:
+
+  oc -n {{ .Values.namespace.name }} get secret {{ .Values.certificate.secretName }} \
+    -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -text

@@ -1,0 +1,27 @@
+# Values for the tenant certificate sample.
+
+# Namespace the tenant certificate lives in. Set namespace.create=true only if
+# the tenant namespace is not already provisioned by the platform.
+namespace:
+  create: false
+  name: daa-aro-rnd
+
+# Reference to the shared ClusterIssuer created by the cert-manager-venafi chart.
+issuerRef:
+  name: robocorp-tpp-venafi-issuer-rnd
+  kind: ClusterIssuer
+
+certificate:
+  name: test-dojo-portal-rnd
+  # Secret cert-manager writes the issued tls.crt/tls.key/ca.crt into.
+  secretName: test-dojo-portal-rnd-tls
+  # 90-day certificate, renewed 30 days before expiry.
+  duration: 2160h
+  renewBefore: 720h
+  commonName: test-dojo-portal-rnd.robocorpint.net
+  dnsNames:
+    - test-dojo-portal-rnd.robocorpint.net
+    - test-dojo-portal.rnd.robocorpint.net
+  privateKey:
+    algorithm: RSA
+    size: 2048

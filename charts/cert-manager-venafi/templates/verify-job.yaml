@@ -1,0 +1,101 @@
+{{- if .Values.verifyJob.enabled }}
+# Operator-readiness gate. Runs the OpenShift CLI to verify the operator is
+# fully installed before the ClusterIssuer (weight 10) is created. Weight 5
+# places it after the RBAC (weight 0) and before the issuer.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-verify-operator
+  namespace: {{ .Values.namespaces.operator }}
+  labels:
+    {{- include "cert-manager-venafi.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.verifyJob.backoffLimit }}
+  # Job-level guard so a wedged pod can't outlive the wait budget.
+  activeDeadlineSeconds: {{ add .Values.verifyJob.timeoutSeconds 120 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cert-manager-venafi.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      {{- if .Values.verifyJob.rbac.create }}
+      serviceAccountName: {{ .Release.Name }}-verify
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: verify
+          image: {{ .Values.verifyJob.image }}
+          imagePullPolicy: {{ .Values.verifyJob.imagePullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.verifyJob.resources | nindent 12 }}
+          env:
+            - name: OPERATOR_NS
+              value: {{ .Values.namespaces.operator | quote }}
+            - name: OPERAND_NS
+              value: {{ .Values.namespaces.operand | quote }}
+            - name: SUBSCRIPTION
+              value: {{ .Values.operator.packageName | quote }}
+            - name: TIMEOUT
+              value: {{ .Values.verifyJob.timeoutSeconds | quote }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              deadline=$(( $(date +%s) + TIMEOUT ))
+              log() { echo "[verify $(date -u +%H:%M:%S)] $*"; }
+              remaining() { local r=$(( deadline - $(date +%s) )); [ "$r" -lt "${1:-15}" ] && r="${1:-15}"; echo "$r"; }
+
+              log "1/4 waiting for Subscription/${SUBSCRIPTION} installedCSV in ${OPERATOR_NS} ..."
+              while :; do
+                csv=$(oc get subscription "${SUBSCRIPTION}" -n "${OPERATOR_NS}" -o jsonpath='{.status.installedCSV}' 2>/dev/null || true)
+                [ -n "${csv}" ] && break
+                [ "$(date +%s)" -ge "${deadline}" ] && { log "TIMEOUT: no installedCSV on Subscription"; exit 1; }
+                sleep 5
+              done
+              log "    installedCSV=${csv}"
+
+              log "2/4 waiting for CSV/${csv} phase=Succeeded ..."
+              while :; do
+                phase=$(oc get csv "${csv}" -n "${OPERATOR_NS}" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+                log "    CSV phase=${phase:-<none>}"
+                [ "${phase}" = "Succeeded" ] && break
+                [ "${phase}" = "Failed" ] && { log "CSV reported Failed"; exit 1; }
+                [ "$(date +%s)" -ge "${deadline}" ] && { log "TIMEOUT: CSV not Succeeded (phase=${phase})"; exit 1; }
+                sleep 10
+              done
+
+              log "3/4 waiting for operand Deployments in ${OPERAND_NS} to be Available ..."
+              while :; do
+                count=$(oc get deploy -n "${OPERAND_NS}" -o name 2>/dev/null | wc -l | tr -d ' ')
+                [ "${count}" -ge 3 ] && break
+                [ "$(date +%s)" -ge "${deadline}" ] && { log "TIMEOUT: expected >=3 operand deployments, found ${count}"; exit 1; }
+                sleep 5
+              done
+              oc wait --for=condition=Available --timeout="$(remaining 30)s" deployment --all -n "${OPERAND_NS}"
+
+              log "4/4 waiting for cert-manager CRDs to be Established ..."
+              for crd in clusterissuers.cert-manager.io certificates.cert-manager.io; do
+                while :; do
+                  oc get crd "${crd}" >/dev/null 2>&1 && break
+                  [ "$(date +%s)" -ge "${deadline}" ] && { log "TIMEOUT: CRD ${crd} not present"; exit 1; }
+                  sleep 5
+                done
+                oc wait --for=condition=Established --timeout="$(remaining 15)s" "crd/${crd}"
+              done
+
+              log "SUCCESS: operator installed, operands Available, CRDs Established — ClusterIssuer may be created"
+{{- end }}

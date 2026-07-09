@@ -1,0 +1,14 @@
+{{- if .Values.trustedCA.enabled }}
+# Empty ConfigMap carrying the inject-trusted-cabundle label. OpenShift's
+# network operator populates its `ca-bundle.crt` key with the cluster-wide
+# trusted CA bundle. The operator Subscription points at this ConfigMap via
+# TRUSTED_CA_CONFIGMAP_NAME so cert-manager trusts internal/enterprise CAs.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.trustedCA.configMapName }}
+  namespace: {{ .Values.namespaces.operand }}
+  labels:
+    config.openshift.io/inject-trusted-cabundle: "true"
+    {{- include "cert-manager-venafi.labels" . | nindent 4 }}
+{{- end }}

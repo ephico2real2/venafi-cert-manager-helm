@@ -1,0 +1,16 @@
+apiVersion: v2
+name: venafi-certificate-sample
+description: >-
+  Tenant-facing sample: requests a TLS certificate from the shared Venafi TPP
+  ClusterIssuer by creating a cert-manager Certificate resource. This is the
+  only object a tenant manages; cert-manager handles issuance and renewal.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - cert-manager
+  - certificate
+  - venafi
+  - tenant
+maintainers:
+  - name: Platform Engineering

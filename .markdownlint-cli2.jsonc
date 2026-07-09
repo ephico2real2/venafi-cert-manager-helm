@@ -1,0 +1,14 @@
+{
+  // House style: keep the real-bug rules (fenced-code language, list numbering,
+  // code-span spacing, trailing whitespace, bare URLs) ON; disable the two
+  // cosmetic rules that are impractical for docs with wide config tables.
+  "config": {
+    "default": true,
+    "MD013": false, // line-length — tables/commands legitimately exceed 80 cols
+    "MD060": false  // table pipe alignment — unpadded pipes are fine and readable
+  },
+  // Lint the maintained docs (root + chart READMEs + steps.md design notes);
+  // ignore the raw Untitled-* scratch dump and tooling.
+  "globs": ["README.md", "steps.md", "charts/**/*.md"],
+  "ignores": ["**/node_modules/**"]
+}

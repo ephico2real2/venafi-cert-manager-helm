@@ -1,0 +1,178 @@
+# Default values for cert-manager-venafi.
+# The chart is split into independently-toggleable concerns: namespaces, trusted
+# CA injection, the OLM operator, the TPP credential + CA-bundle secrets, the
+# optional CA-pull Job, the operator-readiness verify Job, and the ClusterIssuer.
+# The verify Job gates ClusterIssuer creation on operator readiness, so a single
+# `helm install` is self-gating — no manual phasing needed (see README).
+
+# -----------------------------------------------------------------------------
+# Namespaces
+# -----------------------------------------------------------------------------
+namespaces:
+  # Create the two namespaces the operator and its operands live in.
+  # Set to false if your platform team pre-creates them (e.g. via GitOps).
+  create: true
+  # Namespace that hosts the OLM operator itself.
+  operator: cert-manager-operator
+  # Namespace that hosts the cert-manager operands (controller, webhook, cainjector)
+  # and the ClusterIssuer's referenced secrets.
+  operand: cert-manager
+
+# -----------------------------------------------------------------------------
+# Trusted CA injection
+# OpenShift's network-operator injects the cluster-wide trusted CA bundle into
+# any ConfigMap carrying the label below. The operator is then told to consume
+# it via the TRUSTED_CA_CONFIGMAP_NAME env var on its Subscription.
+# -----------------------------------------------------------------------------
+trustedCA:
+  enabled: true
+  configMapName: trusted-ca
+
+# -----------------------------------------------------------------------------
+# OLM operator install (OperatorGroup + Subscription)
+# -----------------------------------------------------------------------------
+operator:
+  enabled: true
+  # Subscription channel for the cert-manager operator package.
+  channel: stable-v1
+  # OLM package name and catalog source.
+  packageName: openshift-cert-manager-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  # PARAMETERIZED per request. Automatic  = OLM approves & applies InstallPlans
+  # as they appear (hands-off upgrades within the channel). Manual = an admin
+  # must approve each InstallPlan before it is applied (change-controlled envs).
+  installPlanApproval: Automatic
+  # OperatorGroup upgrade strategy. "Default" preserves OLM's standard behavior.
+  upgradeStrategy: Default
+
+# -----------------------------------------------------------------------------
+# TPP secrets
+# Both secrets live in the operand namespace and are referenced by the
+# ClusterIssuer. By default they are NOT created by Helm — credentials and CA
+# material should be delivered out-of-band (sealed-secrets, ESO, `oc create
+# secret`, vault). Flip `create: true` only for throwaway/test clusters.
+# -----------------------------------------------------------------------------
+tppCredentials:
+  # AD service-account credentials cert-manager uses to authenticate to TPP.
+  # The Venafi issuer requires the exact keys `username` and `password`.
+  #
+  # Two modes:
+  #   create: false (default) — EXISTING SECRET. The chart does not create it;
+  #     `secretName` must already exist in the operand namespace. Create it as a
+  #     prerequisite via `oc create secret` or a YAML manifest (see README).
+  #   create: true — the chart renders the Secret from the base64 values below,
+  #     written to `data` (NOT stringData). Encode with:
+  #       printf '%s' '<AD_SERVICE_ACCOUNT>'          | base64
+  #       printf '%s' '<AD_SERVICE_ACCOUNT_PASSWORD>' | base64
+  create: false
+  secretName: tpp-secret
+  usernameBase64: ""
+  passwordBase64: ""
+
+tppCABundle:
+  # Intermediate + root CA chain used to verify the TPP endpoint's TLS cert.
+  # NOTE: only needed if you reference it from the issuer
+  # (clusterIssuer.venafi.tpp.caBundleSecretRef.enabled=true). When the
+  # operator's trusted-CA injection already covers the TPP CA, the issuer trusts
+  # the endpoint via the injected system trust and this secret is unnecessary.
+  create: false
+  secretName: robocorp-bundle-cert-tpp-ca
+  key: ca.crt
+  # PEM bundle (intermediate + root). Provide via --set-file caBundle=... or a
+  # values override. Populate this secret in one of three ways: this PEM
+  # (create=true), the caPullJob below, or out-of-band (`oc create secret`).
+  caBundle: ""
+
+# -----------------------------------------------------------------------------
+# CA-pull Job
+# A Helm hook Job that pulls the endpoint's certificate chain, strips the leaf,
+# and writes the intermediate+root into the caBundle secret — automating the
+# manual `openssl s_client ... | oc create secret` runbook step. It runs BEFORE
+# the ClusterIssuer (hook weight 3 < 10).
+#
+# GATING: the job is controlled by the SAME switch as the issuer reference —
+# clusterIssuer.venafi.tpp.caBundleSecretRef.enabled. When that is false
+# (default), the job is skipped entirely along with the caBundleSecretRef.
+# `enabled` below is the SOURCE selector: true (default) = pull from the
+# endpoint; false = supply the secret via tppCABundle.create or out-of-band.
+# -----------------------------------------------------------------------------
+caPullJob:
+  enabled: true
+  # Image must provide openssl + oc (the ose-cli image has both).
+  image: registry.redhat.io/openshift4/ose-cli:latest
+  imagePullPolicy: IfNotPresent
+  # Endpoint to pull the chain from. Defaults to the TPP host; override for
+  # testing against a reachable placeholder, e.g. --set caPullJob.host=google.com
+  host: vta-qa.robocorpint.net
+  port: 443
+  backoffLimit: 2
+  # Create the ServiceAccount + (secret-writer) Role/Binding the Job needs.
+  rbac:
+    create: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    # `oc apply` loads the OpenAPI schema client-side; 512Mi headroom avoids
+    # the OOMKill that a tighter limit triggers.
+    limits:
+      cpu: 250m
+      memory: 512Mi
+
+# -----------------------------------------------------------------------------
+# Operator-readiness verification job
+# A Helm post-install/post-upgrade hook Job that runs the OpenShift CLI to gate
+# ClusterIssuer creation on the operator being fully installed. It waits for:
+#   1. the Subscription's installedCSV to be set,
+#   2. that CSV to reach phase=Succeeded,
+#   3. the cert-manager operand Deployments to be Available,
+#   4. the clusterissuers/certificates CRDs to be Established.
+# When enabled, the ClusterIssuer is emitted as a higher-weight hook so Helm
+# creates it ONLY after this Job exits 0 — a single `helm install` becomes
+# self-gating (no manual two-phase). If the Job fails, the release fails and the
+# ClusterIssuer is never created.
+verifyJob:
+  enabled: true
+  # Image providing the `oc` binary. The Red Hat ose-cli image pulls on any
+  # entitled OpenShift/CRC cluster via the global pull secret.
+  image: registry.redhat.io/openshift4/ose-cli:latest
+  imagePullPolicy: IfNotPresent
+  # Overall wait budget for the verification, in seconds.
+  timeoutSeconds: 600
+  backoffLimit: 1
+  # Create the ServiceAccount + (read-only) ClusterRole/Binding the Job needs.
+  # Disable if your platform provisions this RBAC out-of-band.
+  rbac:
+    create: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+# -----------------------------------------------------------------------------
+# Venafi TPP ClusterIssuer
+# Requires the cert-manager.io CRDs, which are installed by the operator.
+# With verifyJob.enabled=true (default), the ClusterIssuer is a gated hook and
+# no manual phasing is needed. With verifyJob.enabled=false it is a plain
+# resource — on a fresh cluster install it once the operator is Ready.
+# -----------------------------------------------------------------------------
+clusterIssuer:
+  enabled: true
+  name: robocorp-tpp-venafi-issuer-rnd
+  venafi:
+    # TPP policy folder (zone) certificates are requested against.
+    zone: '\VED\Policy\Testing\ARO'
+    tpp:
+      url: https://vta-qa.robocorpint.net/vedsdk
+      # Optional per-issuer CA bundle to verify the TPP endpoint's TLS cert.
+      # Default OFF: when trustedCA injection covers the TPP CA, cert-manager
+      # trusts the endpoint via the injected system trust and this is redundant.
+      # Enable only if the TPP CA is NOT in the cluster-wide trust bundle — then
+      # supply the secret via tppCABundle.create, caPullJob, or out-of-band.
+      # name/key default to tppCABundle.secretName/key (single source of truth).
+      caBundleSecretRef:
+        enabled: false

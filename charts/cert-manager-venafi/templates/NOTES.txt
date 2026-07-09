@@ -1,0 +1,44 @@
+cert-manager-venafi installed as release "{{ .Release.Name }}".
+
+Component summary:
+{{ if .Values.namespaces.create }}  ✔ namespaces: {{ .Values.namespaces.operator }}, {{ .Values.namespaces.operand }}{{ else }}  – namespaces: not managed by this release{{ end }}
+{{ if .Values.trustedCA.enabled }}  ✔ trusted CA ConfigMap: {{ .Values.trustedCA.configMapName }} (namespace {{ .Values.namespaces.operand }}){{ else }}  – trusted CA injection: disabled{{ end }}
+{{ if .Values.operator.enabled }}  ✔ operator Subscription: {{ .Values.operator.packageName }} (channel {{ .Values.operator.channel }}, installPlanApproval {{ .Values.operator.installPlanApproval }}){{ else }}  – operator install: disabled{{ end }}
+{{ if .Values.tppCredentials.create }}  ✔ tpp credentials secret: {{ .Values.tppCredentials.secretName }}{{ else }}  ! tpp credentials secret ({{ .Values.tppCredentials.secretName }}) must exist in {{ .Values.namespaces.operand }} — create it out-of-band{{ end }}
+{{ if .Values.clusterIssuer.venafi.tpp.caBundleSecretRef.enabled }}{{ if .Values.caPullJob.enabled }}  ✔ CA bundle: pulled from {{ .Values.caPullJob.host }}:{{ .Values.caPullJob.port }} by the CA-pull Job (before the issuer){{ else if .Values.tppCABundle.create }}  ✔ CA bundle: from provided PEM into {{ .Values.tppCABundle.secretName }}{{ else }}  ! CA bundle: issuer references {{ .Values.tppCABundle.secretName }} — create it out-of-band{{ end }}{{ else }}  – CA bundle: not used (issuer trusts TPP via the injected trusted-CA bundle){{ end }}
+{{ if .Values.verifyJob.enabled }}  ✔ operator-readiness verify Job: gates the ClusterIssuer (post-install hook){{ else }}  – verify Job: disabled (manual two-phase install){{ end }}
+{{ if .Values.clusterIssuer.enabled }}  ✔ ClusterIssuer: {{ .Values.clusterIssuer.name }}{{ if .Values.verifyJob.enabled }} (created only after the verify Job passes){{ end }}{{ else }}  – ClusterIssuer: disabled{{ end }}
+
+Next steps:
+
+1. Confirm the operator installed:
+     oc get csv -n {{ .Values.namespaces.operator }}
+     oc get pods -n {{ .Values.namespaces.operand }}
+
+{{- if .Values.operator.enabled }}
+{{- if eq .Values.operator.installPlanApproval "Manual" }}
+
+   installPlanApproval is Manual — approve the pending InstallPlan:
+     oc get installplan -n {{ .Values.namespaces.operator }}
+     oc patch installplan <name> -n {{ .Values.namespaces.operator }} --type merge -p '{"spec":{"approved":true}}'
+{{- end }}
+{{- end }}
+
+{{- if not .Values.tppCredentials.create }}
+
+2. Ensure the TPP credentials secret exists in the {{ .Values.namespaces.operand }} namespace:
+     oc -n {{ .Values.namespaces.operand }} create secret generic {{ .Values.tppCredentials.secretName }} \
+       --from-literal=username='<AD_SERVICE_ACCOUNT>' \
+       --from-literal=password='<AD_SERVICE_ACCOUNT_PASSWORD>'
+{{- end }}
+{{- if and .Values.clusterIssuer.venafi.tpp.caBundleSecretRef.enabled (not .Values.caPullJob.enabled) (not .Values.tppCABundle.create) }}
+
+   The issuer references a CA bundle but neither the pull Job nor a PEM is set —
+   create the secret out-of-band:
+     oc -n {{ .Values.namespaces.operand }} create secret generic {{ .Values.tppCABundle.secretName }} \
+       --from-file={{ .Values.tppCABundle.key }}=robocorp-bundle-cert.pem
+{{- end }}
+
+3. Verify the ClusterIssuer is Ready:
+     oc get clusterissuer {{ .Values.clusterIssuer.name }} -o wide
+     # Expect: Ready=True, Reason="Venafi issuer started"

@@ -1,0 +1,151 @@
+{{- /*
+The CA-pull job is gated by the SAME switch as the issuer's caBundleSecretRef:
+clusterIssuer.venafi.tpp.caBundleSecretRef.enabled. When that is on, this job
+runs (weight 3) before the ClusterIssuer (weight 10) and populates the secret
+the issuer references. caPullJob.enabled (default true) selects the SOURCE — set
+it false to instead supply the secret via tppCABundle.create or out-of-band.
+*/ -}}
+{{- if and .Values.clusterIssuer.enabled .Values.clusterIssuer.venafi.tpp.caBundleSecretRef.enabled .Values.caPullJob.enabled }}
+{{- if .Values.tppCABundle.create }}
+{{- fail "The CA-pull job and tppCABundle.create both create the same caBundle secret — set caPullJob.enabled=false to use the PEM, or tppCABundle.create=false to pull." }}
+{{- end }}
+{{- if .Values.caPullJob.rbac.create }}
+# Secret-writer RBAC for the CA-pull Job, scoped to the operand namespace only.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-capull
+  namespace: {{ .Values.namespaces.operand }}
+  labels:
+    {{- include "cert-manager-venafi.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "1"
+    "helm.sh/hook-delete-policy": before-hook-creation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-capull
+  namespace: {{ .Values.namespaces.operand }}
+  labels:
+    {{- include "cert-manager-venafi.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "1"
+    "helm.sh/hook-delete-policy": before-hook-creation
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-capull
+  namespace: {{ .Values.namespaces.operand }}
+  labels:
+    {{- include "cert-manager-venafi.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "1"
+    "helm.sh/hook-delete-policy": before-hook-creation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-capull
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-capull
+    namespace: {{ .Values.namespaces.operand }}
+---
+{{- end }}
+# Pulls the TPP endpoint chain, strips the leaf, and writes the intermediate+root
+# into the caBundle secret. Weight 3 → after its RBAC (1), before the
+# ClusterIssuer hook (10) so the secret exists if the issuer references it.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-capull
+  namespace: {{ .Values.namespaces.operand }}
+  labels:
+    {{- include "cert-manager-venafi.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "3"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.caPullJob.backoffLimit }}
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        {{- include "cert-manager-venafi.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      {{- if .Values.caPullJob.rbac.create }}
+      serviceAccountName: {{ .Release.Name }}-capull
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: work
+          emptyDir:
+            medium: Memory
+      containers:
+        - name: capull
+          image: {{ .Values.caPullJob.image }}
+          imagePullPolicy: {{ .Values.caPullJob.imagePullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.caPullJob.resources | nindent 12 }}
+          volumeMounts:
+            - name: work
+              mountPath: /tmp
+          env:
+            - name: HOST
+              value: {{ .Values.caPullJob.host | quote }}
+            - name: PORT
+              value: {{ .Values.caPullJob.port | quote }}
+            - name: OPERAND_NS
+              value: {{ .Values.namespaces.operand | quote }}
+            - name: SECRET_NAME
+              value: {{ .Values.tppCABundle.secretName | quote }}
+            - name: SECRET_KEY
+              value: {{ .Values.tppCABundle.key | quote }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              log() { echo "[capull $(date -u +%H:%M:%S)] $*"; }
+
+              log "pulling chain from ${HOST}:${PORT} ..."
+              openssl s_client -connect "${HOST}:${PORT}" -servername "${HOST}" -showcerts < /dev/null 2>/dev/null \
+                | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' > /tmp/full-chain.pem
+              total=$(grep -c 'BEGIN CERTIFICATE' /tmp/full-chain.pem || echo 0)
+              log "received ${total} cert(s) in the chain"
+              [ "${total}" -ge 2 ] || { log "ERROR: expected >=2 certs (leaf + issuer(s)); the endpoint returned ${total}"; exit 1; }
+
+              # Skip the first cert (leaf/server) — keep intermediate + root.
+              awk '/-----BEGIN CERTIFICATE-----/ {n++} n >= 2 {print}' /tmp/full-chain.pem > /tmp/robocorp-bundle-cert.pem
+              kept=$(grep -c 'BEGIN CERTIFICATE' /tmp/robocorp-bundle-cert.pem || echo 0)
+              log "kept ${kept} CA cert(s) after stripping the leaf:"
+              openssl crl2pkcs7 -nocrl -certfile /tmp/robocorp-bundle-cert.pem | openssl pkcs7 -print_certs -noout | sed 's/^/    /'
+              [ -s /tmp/robocorp-bundle-cert.pem ] || { log "ERROR: empty CA bundle"; exit 1; }
+
+              log "writing secret ${OPERAND_NS}/${SECRET_NAME} (key ${SECRET_KEY}) ..."
+              # Server-side apply keeps the merge on the API server, avoiding the
+              # client-side OpenAPI schema load that OOMKills a small container.
+              oc create secret generic "${SECRET_NAME}" -n "${OPERAND_NS}" \
+                --from-file="${SECRET_KEY}=/tmp/robocorp-bundle-cert.pem" \
+                --dry-run=client -o yaml \
+                | oc apply --server-side --force-conflicts --field-manager=capull-job -f -
+              log "SUCCESS: caBundle secret populated from ${HOST}:${PORT}"
+{{- end }}

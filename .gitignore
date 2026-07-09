@@ -1,0 +1,24 @@
+# Helm
+charts/**/charts/
+*.tgz
+Chart.lock
+
+# Rendered / working cert material — never commit secrets or pulled CA files
+*.pem
+*.key
+*.crt
+full-chain.pem
+
+# Node (markdownlint tooling)
+node_modules/
+
+# Editor / OS
+.DS_Store
+*.swp
+*.bak
+*.orig
+.idea/
+.vscode/
+
+# raw scratch dump — not part of the chart repo
+Untitled-*
