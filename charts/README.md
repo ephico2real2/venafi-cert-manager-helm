@@ -64,7 +64,7 @@ helm install cert-manager-venafi
            weight 0   Verify RBAC
            weight 1   CA-pull RBAC   ┐ only when the CA bundle is enabled
            weight 3   CA-pull Job  ──┘ pulls the CA chain → writes the secret
-           weight 5   Verify Job   ─── waits: CSV Succeeded · pods Available · CRDs Established
+           weight 5   Verify Job   ─── waits: CSV Succeeded · pods Available · CRDs Established · webhook serving
            weight 10  ClusterIssuer ── created ONLY after the Verify Job passes
 ```
 

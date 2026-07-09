@@ -30,6 +30,10 @@ spec:
         runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
+      volumes:
+        - name: work
+          emptyDir:
+            medium: Memory
       containers:
         - name: verify
           image: {{ .Values.verifyJob.image }}
@@ -41,7 +45,14 @@ spec:
               drop: ["ALL"]
           resources:
             {{- toYaml .Values.verifyJob.resources | nindent 12 }}
+          volumeMounts:
+            - name: work
+              mountPath: /tmp
           env:
+            # oc writes its discovery/OpenAPI cache here; /tmp is the writable
+            # emptyDir since the root filesystem is read-only.
+            - name: KUBECACHEDIR
+              value: /tmp/.kube/cache
             - name: OPERATOR_NS
               value: {{ .Values.namespaces.operator | quote }}
             - name: OPERAND_NS
@@ -59,7 +70,7 @@ spec:
               log() { echo "[verify $(date -u +%H:%M:%S)] $*"; }
               remaining() { local r=$(( deadline - $(date +%s) )); [ "$r" -lt "${1:-15}" ] && r="${1:-15}"; echo "$r"; }
 
-              log "1/4 waiting for Subscription/${SUBSCRIPTION} installedCSV in ${OPERATOR_NS} ..."
+              log "1/5 waiting for Subscription/${SUBSCRIPTION} installedCSV in ${OPERATOR_NS} ..."
               while :; do
                 csv=$(oc get subscription "${SUBSCRIPTION}" -n "${OPERATOR_NS}" -o jsonpath='{.status.installedCSV}' 2>/dev/null || true)
                 [ -n "${csv}" ] && break
@@ -68,7 +79,7 @@ spec:
               done
               log "    installedCSV=${csv}"
 
-              log "2/4 waiting for CSV/${csv} phase=Succeeded ..."
+              log "2/5 waiting for CSV/${csv} phase=Succeeded ..."
               while :; do
                 phase=$(oc get csv "${csv}" -n "${OPERATOR_NS}" -o jsonpath='{.status.phase}' 2>/dev/null || true)
                 log "    CSV phase=${phase:-<none>}"
@@ -78,7 +89,7 @@ spec:
                 sleep 10
               done
 
-              log "3/4 waiting for operand Deployments in ${OPERAND_NS} to be Available ..."
+              log "3/5 waiting for operand Deployments in ${OPERAND_NS} to be Available ..."
               while :; do
                 count=$(oc get deploy -n "${OPERAND_NS}" -o name 2>/dev/null | wc -l | tr -d ' ')
                 [ "${count}" -ge 3 ] && break
@@ -87,7 +98,7 @@ spec:
               done
               oc wait --for=condition=Available --timeout="$(remaining 30)s" deployment --all -n "${OPERAND_NS}"
 
-              log "4/4 waiting for cert-manager CRDs to be Established ..."
+              log "4/5 waiting for cert-manager CRDs to be Established ..."
               for crd in clusterissuers.cert-manager.io certificates.cert-manager.io; do
                 while :; do
                   oc get crd "${crd}" >/dev/null 2>&1 && break
@@ -97,5 +108,22 @@ spec:
                 oc wait --for=condition=Established --timeout="$(remaining 15)s" "crd/${crd}"
               done
 
-              log "SUCCESS: operator installed, operands Available, CRDs Established — ClusterIssuer may be created"
+              # "Deployment Available" is not "webhook serving admission": on a fresh
+              # install the cainjector may not have wired the webhook CA yet, so a
+              # ClusterIssuer create fails with an x509/"webhook.cert-manager.io"
+              # error. Probe with a server-dry-run (nothing persisted) until the
+              # validating webhook actually accepts a cert-manager resource.
+              log "5/5 waiting for the cert-manager validating webhook to serve admission ..."
+              PROBE='{"apiVersion":"cert-manager.io/v1","kind":"ClusterIssuer","metadata":{"name":"cmv-webhook-probe"},"spec":{"selfSigned":{}}}'
+              while :; do
+                if out=$(printf '%s' "${PROBE}" | oc create --dry-run=server -f - 2>&1); then
+                  log "    webhook admission OK"
+                  break
+                fi
+                log "    webhook not ready yet: $(printf '%s' "${out}" | tr '\n' ' ' | tail -c 140)"
+                [ "$(date +%s)" -ge "${deadline}" ] && { log "TIMEOUT: webhook not serving admission"; exit 1; }
+                sleep 5
+              done
+
+              log "SUCCESS: operator installed, operands Available, CRDs Established, webhook serving — ClusterIssuer may be created"
 {{- end }}

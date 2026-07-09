@@ -6,7 +6,8 @@ that tenants request certificates from.
 
 A single `helm install` is **self-gating**: a post-install hook Job waits for the
 operator to be fully installed (CSV `Succeeded`, operands `Available`, CRDs
-`Established`) before the `ClusterIssuer` is created. See the
+`Established`, and the **validating webhook serving admission**) before the
+`ClusterIssuer` is created. See the
 [top-level README](../README.md) for the full install + validation walkthrough.
 
 - **Type:** application · **Scope:** cluster (operator + `ClusterIssuer`)

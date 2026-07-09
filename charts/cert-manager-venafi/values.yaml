@@ -148,10 +148,11 @@ verifyJob:
   resources:
     requests:
       cpu: 50m
-      memory: 64Mi
-    limits:
-      cpu: 200m
       memory: 128Mi
+    # the step-5 webhook probe runs `oc apply`; 512Mi headroom avoids an OOMKill.
+    limits:
+      cpu: 250m
+      memory: 512Mi
 
 # -----------------------------------------------------------------------------
 # Venafi TPP ClusterIssuer
