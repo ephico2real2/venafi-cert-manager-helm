@@ -186,6 +186,27 @@ A magic number that matches today's three deployments (`cert-manager`, `cert-man
 would hang until timeout. Derive the expectation from the CSV's own `.spec.install.spec.deployments` instead,
 so the chart asks the operator what it installs.
 
+### 3.10 No `required` on the identifiers the verify Job depends on
+
+`required` appears only in the two secret templates. `NAMESPACE`, `SUBSCRIPTION` and `OPERAND_NS` are passed
+to the verify Job from values with no guard, and a misspelled values key **renders as an empty string and
+does not fail**. An empty identifier makes every query match nothing, so the Job burns its whole budget and
+reports `TIMEOUT: no installedCSV` — pointing at OLM for what is a typo.
+
+This is not hypothetical. The sibling NCO chart shipped exactly this: a readiness Job read
+`.Values.subscription.name`, which does not exist (the key is `packageName`), and the run reported
+`no .* CSV reached Succeeded` after five minutes. Five minutes and a wrong diagnosis for a typo.
+
+Fix: `required` on every identifier baked into a script, so the same mistake is a render-time error naming
+the key instead of a runtime timeout blaming something else.
+
+### 3.11 The ca-pull Job's deadline is hardcoded, the verify Job's is derived
+
+`capull-job.yaml` has `activeDeadlineSeconds: 300` as a literal, while `verify-job.yaml` correctly uses
+`add .Values.verifyJob.timeoutSeconds 120`. If anyone raises the CA-pull budget in values, the kubelet still
+kills the pod at 300s — part-way, with no message of its own, which is the least debuggable way for a Job to
+fail. Derive it the same way the verify Job does.
+
 ## 4. Not in scope
 
 - The `venafi-certificate-sample` chart.
@@ -207,3 +228,48 @@ so the chart asks the operator what it installs.
 | no regression | `helm lint`, render every values combination, and a real `helm upgrade` on the cluster with the release's ClusterIssuer and operand state compared before/after |
 
 There is no CI in this repo at all, so the two check scripts above are also the first CI it gets.
+
+Process rules carried from today, which are about how the validation is done rather than what is validated:
+
+- **Run the shipped artifact, not a paraphrase.** Extract the script from the *rendered* ConfigMap or Job and
+  run that. A hand-retyped approximation tests the retyping.
+- **Negative-test every new check.** A check that cannot fail is worth nothing; break the chart, confirm the
+  error names the line and the fix, restore.
+- **Enumerate which changed paths did NOT execute.** On the group-sync change, the upgrade looked like full
+  coverage until the paths were counted: 12 of 47 changed lines were in test scripts that only run under
+  `helm test`, and the relabel write path had executed zero times because it found nothing to fix. Both were
+  then exercised deliberately. State the gap rather than letting a green upgrade imply coverage.
+- **Compare UIDs, not counts.** A delete-and-recreate leaves counts identical. This is how a sweeper bug
+  survived its own verification: 42 objects before, 42 after.
+- **`oc auth can-i` as the actual ServiceAccount**, not as yourself. And pass arguments explicitly — `oc auth
+  can-i ${probe}` in zsh sends the whole string as one argument and reports a false failure.
+- **A cancelled `helm --wait` is not a failed install.** It records the revision as
+  `failed: context canceled` while the Kubernetes work runs to completion, so re-run the upgrade to make the
+  release record reality rather than assuming something broke.
+
+## 6. Lessons from today's two charts, audited against this one
+
+The point of this section is that it is not a wish list — each row was checked against the actual templates,
+and three of the hardest-won lessons are **already implemented here**. Those are left alone.
+
+| lesson | came from | status in this chart |
+|---|---|---|
+| ONE shared deadline for all stages, not one per stage | NCO readiness wait, where three loops could each take the full budget and reach 3x the documented number | **already correct** — one `deadline=$(( now + TIMEOUT ))`, used by all five stages |
+| `activeDeadlineSeconds` above the script's own budget, so the script's message wins over a silent kubelet kill | NCO readiness wait | **already correct** in verify (`timeoutSeconds + 120`); **to fix** in ca-pull, which hardcodes 300 (3.11) |
+| Staged progress logging, so silence is not read as a hang | the orphan sweeper, whose 74 silent seconds were read as "it only lists, never deletes" | **already correct** — `1/5` … `5/5` with per-stage detail |
+| Approver shares the Subscription's wave, `hook: Sync` not `PostSync` | NCO, where wave 1 + PostSync deadlocked a first ArgoCD sync | **to apply** (3.2) |
+| `SkipDryRunOnMissingResource=true` on a CR whose CRD arrives mid-sync | NCO policy CRs | **to apply** on the ClusterIssuer (3.4) |
+| Every document declares a sync-wave; absent is not neutral | NCO check-ordering.py | **to apply** — 0 of 16 today (3.3) |
+| Every Job carries an ArgoCD hook annotation, or Argo treats it as an ordinary resource and the second sync fails on the immutable `spec.template` | reviewing this plan | **to apply** to all three Jobs (3.8) |
+| Hook resources are *created*, never recorded, so they survive uninstall and never reconcile | NCO namespace-as-a-hook | **to apply** — verify RBAC and ca-pull RBAC (3.5) |
+| An empty read is not a negative answer; keep the exit status and branch | NCO approver reporting a successful no-op over a Forbidden | **to apply** (3.6) |
+| Forbidden-as-not-found is the recurring killer | the 0.19.1 sweeper deleted all 42 RoleBindings it managed because `! oc get role` is true for Forbidden as well as absent | **to apply** — same shape in the verify Job's reads (3.6) |
+| `required` on identifiers baked into scripts | NCO reading a values key that does not exist and blaming OLM | **to apply** (3.10) |
+| Name every resource in full; a plural is not reserved | `oc get subscription` binding to `subscriptions.messaging.knative.dev` | **to apply** — and this chart is more exposed, because `KUBECACHEDIR` is a fresh `emptyDir` so discovery is cold every run (3.7) |
+| A misrouted **list** returns nothing rather than failing | group-sync relabel, whose decisions are list-driven | **to apply** — `oc get deploy -n cert-manager` would read as "no operands yet" forever (3.7) |
+| Derive expectations from the source of truth, not a magic number | NCO deriving the operand deployment from the CSV | **to apply** — `[ count -ge 3 ]` (3.9) |
+| No arbitrary cap on work that must finish; pace and retry instead | the sweeper refusing 429 deletions | **not applicable** — nothing here deletes in bulk |
+| Counters in a `printf \| while read` pipeline are lost to the subshell | the sweeper reporting success while every delete failed | **not applicable** — checked; no accumulating counter runs in a pipeline here |
+| `$( )` strips trailing newlines, so `wc -l` counts separators and `while read` drops the last line | the sweeper printing 4 live CRs where 5 existed | **not applicable** — the one `wc -l` is on a live pipeline, not a captured string |
+| `crds/` is the only Helm mechanism early enough for an *ordinary* CR | NCO first install | **not applicable, and validated as such** — see section 2. The CR here is a hook behind a gate, and Helm re-discovers per hook. |
+| Under ArgoCD, `crds/` is rendered by `--include-crds`, so set `skipCrds: true` | group-sync vendored CRD | **not applicable** — no `crds/` here, which is precisely why not vendoring is the better answer |
