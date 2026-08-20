@@ -179,20 +179,32 @@ jobs:
 
   version-bump:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    # NOT `if: pull_request`. An earlier version only ran on PRs, so two direct pushes to main skipped it
+    # entirely — and that is exactly how a chart shipped a README change under an already-released 0.3.1,
+    # leaving the published tarball stale while the run stayed green. Runs on push and workflow_call too;
+    # the base commit is chosen per event below.
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     steps:
       - uses: actions/checkout@v4
         with:
+          # Full history AND tags: the check below asks whether <name>-<version> is already released,
+          # which is a tag lookup.
           fetch-depth: 0
-      - name: A change under charts/ requires a new Chart.yaml version
+          fetch-tags: true
+      - name: A changed chart must not reuse an already-published version
         # EVERY chart under charts/, not just the main one. helm.yaml publishes each subdirectory of
         # charts/, so the sample chart is released too — and chart-releaser SKIPS a version it has
         # already published (skip_existing), so shipping a change under an unchanged version publishes
         # nothing and still reports green. Checking only $CHART would leave that silent.
         env:
-          BASE: ${{ github.event.pull_request.base.sha }}
+          # A PR compares against its base; a push compares against what main was before the push.
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
         run: |
           rc=0
+          # A brand-new branch, or the very first push, reports an all-zero before-SHA with no tree to diff.
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            echo "no base commit to compare against — skipping"; exit 0
+          fi
           for dir in charts/*/; do
             [ -f "${dir}Chart.yaml" ] || continue
             chart="${dir%/}"
@@ -201,10 +213,18 @@ jobs:
             fi
             old=$(git show "$BASE:$chart/Chart.yaml" 2>/dev/null | awk '/^version:/{print $2}')
             new=$(awk '/^version:/{print $2}' "$chart/Chart.yaml")
+            name=$(awk '/^name:/{print $2}' "$chart/Chart.yaml")
             echo "${chart}: changed, $old -> $new"
-            if [ "$old" = "$new" ]; then
-              echo "::error::$chart changed but version is still $new — chart-releaser would skip it silently"
+            # THE REAL INVARIANT IS "do not ship a version that is already published", not "always bump".
+            # chart-releaser tags a release <name>-<version> and SKIPS a version it has already released,
+            # so re-shipping one publishes nothing while the run stays green. A chart that has never been
+            # released can ship at its current version quite legitimately — an earlier draft of this check
+            # demanded a bump there too, and flagged the sample chart for shipping 0.1.0 for the first time.
+            if git rev-parse -q --verify "refs/tags/${name}-${new}" >/dev/null; then
+              echo "::error::$chart changed, but ${name}-${new} is already released — chart-releaser would skip it silently. Bump the version."
               rc=1
+            else
+              echo "  ${name}-${new} not yet released — publishable as-is"
             fi
           done
           exit $rc
