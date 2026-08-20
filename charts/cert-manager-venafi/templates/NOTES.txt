@@ -12,15 +12,28 @@ Component summary:
 Next steps:
 
 1. Confirm the operator installed:
-     oc get csv -n {{ .Values.namespaces.operator }}
+     oc get clusterserviceversions.operators.coreos.com -n {{ .Values.namespaces.operator }}
      oc get pods -n {{ .Values.namespaces.operand }}
 
 {{- if .Values.operator.enabled }}
 {{- if eq .Values.operator.installPlanApproval "Manual" }}
+{{- if .Values.installPlanApprover.enabled }}
 
-   installPlanApproval is Manual — approve the pending InstallPlan:
-     oc get installplan -n {{ .Values.namespaces.operator }}
-     oc patch installplan <name> -n {{ .Values.namespaces.operator }} --type merge -p '{"spec":{"approved":true}}'
+   installPlanApproval is Manual, and the installplan-approver Job already approved the pinned
+   version ({{ .Values.operator.startingCSV }}) for you — nothing to do by hand.
+
+   A channel upgrade to any OTHER version is deliberately left unapproved. To adopt one, bump
+   operator.startingCSV and upgrade — do not approve it on the cluster, or the next sync reverts
+   to the pin. What is waiting, if anything:
+     oc get installplans.operators.coreos.com -n {{ .Values.namespaces.operator }}
+     oc logs -n {{ .Values.namespaces.operator }} job/{{ .Release.Name }}-installplan-approver
+{{- else }}
+
+   installPlanApproval is Manual and installPlanApprover.enabled is FALSE, so nothing approves
+   InstallPlans — the operator will not install until you approve one by hand:
+     oc get installplans.operators.coreos.com -n {{ .Values.namespaces.operator }}
+     oc patch installplans.operators.coreos.com <name> -n {{ .Values.namespaces.operator }} --type merge -p '{"spec":{"approved":true}}'
+{{- end }}
 {{- end }}
 {{- end }}
 
@@ -40,5 +53,5 @@ Next steps:
 {{- end }}
 
 3. Verify the ClusterIssuer is Ready:
-     oc get clusterissuer {{ .Values.clusterIssuer.name }} -o wide
+     oc get clusterissuers.cert-manager.io {{ .Values.clusterIssuer.name }} -o wide
      # Expect: Ready=True, Reason="Venafi issuer started"

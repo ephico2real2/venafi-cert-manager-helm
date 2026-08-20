@@ -1,25 +1,47 @@
 {{- if .Values.clusterIssuer.enabled }}
+{{- if not .Values.verifyJob.enabled }}
+{{- fail "clusterIssuer.enabled=true requires verifyJob.enabled=true. The verify Job is what makes this resource installable in one pass: without it the ClusterIssuer renders as an ORDINARY resource, and ordinary resources are all built together BEFORE anything is applied — so on a cluster that does not yet serve cert-manager.io/v1 the install fails outright with 'no matches for kind ClusterIssuer'. That is the manual two-step this chart used to document. Either leave the gate on, or set clusterIssuer.enabled=false and apply the issuer separately once the operator is Ready." }}
+{{- end }}
 # Shared Venafi TPP ClusterIssuer. Tenants request certificates by referencing
 # this issuer from a Certificate resource (see the venafi-certificate-sample
 # chart) and never touch TPP credentials directly.
 #
-# Requires the cert-manager.io CRDs installed by the operator. With
-# verifyJob.enabled=true this is a post-install/post-upgrade hook at weight 10,
-# so Helm creates it only after the verification Job (weight 5) exits 0 —
-# guaranteeing the CRDs exist. With verifyJob.enabled=false it is a plain
-# resource (install after the operator is Ready).
+# Requires the cert-manager.io CRDs installed by the operator. It is a
+# post-install/post-upgrade hook at weight 10, so Helm creates it only after the
+# verification Job (weight 5) exits 0 — which is what guarantees the CRDs exist
+# AND that the webhook fronting them is answering. That claim was validated in a
+# sandbox rather than assumed; see the annotations below.
+#
+# The gate is not optional: clusterIssuer.enabled=true REQUIRES
+# verifyJob.enabled=true, and the render fails with an explanation otherwise.
+# Ungated, this renders as an ordinary resource — and ordinary resources are all
+# built before anything is applied, which fails on a cluster that does not serve
+# cert-manager.io/v1 yet.
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
 metadata:
   name: {{ .Values.clusterIssuer.name }}
   labels:
     {{- include "cert-manager-venafi.labels" . | nindent 4 }}
-  {{- if .Values.verifyJob.enabled }}
   annotations:
+    # Wave 4: last. Everything the gate at wave 3 waited for — CSV Succeeded, operands Available, CRDs
+    # Established, webhook serving — is a precondition of this one resource. ArgoCD deletes in REVERSE wave
+    # order, so on removal this goes BEFORE the Subscription, while cert-manager is still running to process
+    # it. Taking the operator away first is how a resource ends up stuck on deletion.
+    argocd.argoproj.io/sync-wave: "4"
+    # ArgoCD dry-runs every resource before applying it, and a dry-run against a kind the cluster does not
+    # serve yet fails THE WHOLE SYNC, not just this document. cert-manager's CRDs are not in this manifest —
+    # OLM brings them mid-sync — so this is exactly the case the option exists for. Per the ArgoCD docs the
+    # dry run still runs once the CRD IS present, so it costs no validation on any later sync.
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    # A HELM HOOK AT WEIGHT 10, after the verify Job at 5. Validated rather than assumed: Helm resolves a
+    # hook's kinds WHEN IT PROCESSES THAT HOOK, not at operation start, so a CRD that appears during the
+    # weight-5 gate is picked up here. Measured in a sandbox chart — a weight-5 hook that creates a CRD and
+    # waits for Established, then a weight-10 hook that is a CR of that kind: the install succeeded. The
+    # same CR with no gate ahead of it fails "unable to build kubernetes object for deleting hook".
     "helm.sh/hook": post-install,post-upgrade
     "helm.sh/hook-weight": "10"
     "helm.sh/hook-delete-policy": before-hook-creation
-  {{- end }}
 spec:
   venafi:
     zone: {{ .Values.clusterIssuer.venafi.zone | quote }}

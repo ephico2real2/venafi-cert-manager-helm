@@ -1,0 +1,67 @@
+{{- if and .Values.operator.enabled .Values.installPlanApprover.enabled }}
+# RBAC for the InstallPlan approver.
+#
+# ORDINARY RESOURCES, NOT HOOKS, deliberately. Helm *creates* hook resources rather than applying them and
+# never records them in the release, so a hooked ServiceAccount and its bindings survive `helm uninstall`,
+# are never reconciled on upgrade, and accumulate. Ordinary resources are also applied before any hook runs,
+# which is exactly the ordering a hook Job needs from its own RBAC.
+#
+# A ROLE, NOT A CLUSTERROLE. Everything the approver reads or writes — the Subscription, its InstallPlans,
+# the CSV — lives in the operator namespace. Approving an InstallPlan is the authority to install operator
+# code onto the cluster, so it is scoped to the one namespace that needs it.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-installplan-approver
+  namespace: {{ .Values.namespaces.operator }}
+  labels:
+    {{- include "cert-manager-venafi.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-installplan-approver
+  namespace: {{ .Values.namespaces.operator }}
+  labels:
+    {{- include "cert-manager-venafi.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+rules:
+  # The Subscription: its .spec.installPlanApproval, and .status.installedCSV, which is how the approver
+  # learns which CSV OLM actually installed rather than guessing from the package name. They differ here —
+  # the package is openshift-cert-manager-operator, the CSV is cert-manager-operator.vX.Y.Z.
+  - apiGroups: ["operators.coreos.com"]
+    resources: ["subscriptions"]
+    verbs: ["get", "list"]
+  # InstallPlans: read every one in the namespace to find the one owned by our Subscription that installs
+  # the pinned CSV, and patch that one's .spec.approved. `list` is needed because the plan's name is
+  # generated (install-xxxxx) and is not knowable in advance.
+  - apiGroups: ["operators.coreos.com"]
+    resources: ["installplans"]
+    verbs: ["get", "list", "patch"]
+  # The CSV's phase, to confirm the approval actually resulted in an install rather than reporting success
+  # the moment the patch returned.
+  - apiGroups: ["operators.coreos.com"]
+    resources: ["clusterserviceversions"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-installplan-approver
+  namespace: {{ .Values.namespaces.operator }}
+  labels:
+    {{- include "cert-manager-venafi.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-installplan-approver
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-installplan-approver
+    namespace: {{ .Values.namespaces.operator }}
+{{- end }}

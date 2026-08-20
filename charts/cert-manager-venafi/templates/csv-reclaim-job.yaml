@@ -1,0 +1,288 @@
+{{- if and .Values.operator.enabled .Values.csvReclaim.enabled }}
+# Clears a CSV orphaned by a previous `helm uninstall`, so this chart installs in ONE SHOT with no human
+# step. PORTED from the sibling namespace-configuration-operator chart
+# (templates/06a-csv-reclaim-job.yaml and the reclaim block of 04-image-override-script.yaml) rather than
+# re-derived — that chart had already diagnosed this, with dates.
+#
+# THE PROBLEM. `helm uninstall` deletes the Subscription, but OLM LEAVES THE CSV BEHIND — measured on this
+# cluster, it carries no ownerReferences at all, so nothing garbage-collects it. The next install cannot
+# then resolve, because a CSV for this package exists that no Subscription references:
+#
+#   ResolutionFailed: constraints not satisfiable:
+#   @existing/cert-manager-operator//cert-manager-operator.v1.19.1 ...
+#
+# Observed here exactly that way: a reinstall sat at pending-install while the approver waited its full
+# budget for an InstallPlan that a failed resolution can never produce, and the install only recovered
+# because a human deleted the CSV.
+#
+# IT MUST SELF-HEAL, NOT MERELY REPORT. Under ArgoCD there is no human in the sync loop to run
+# `oc delete clusterserviceversions...`, so a Subscription stuck on ResolutionFailed fails every sync
+# forever.
+#
+# ORDERING — helm weight -6, AHEAD OF THE APPROVER (-5). The sibling chart found this the hard way and its
+# header records the measurement: with the reclaim behind the approver, the approver "sat waiting for an
+# InstallPlan that a failed resolution can never produce" from 03:26:53 to 03:30:29, and that install only
+# recovered because a reconcile CronJob happened to fire. Clearing the orphan before anything starts
+# waiting removes the luck. Wave 0 puts it with the Subscription whose status it reads.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-csv-reclaim
+  namespace: {{ .Values.namespaces.operator }}
+  labels:
+    {{- include "cert-manager-venafi.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "-6"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ add .Values.csvReclaim.waitSeconds 120 }}
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        {{- include "cert-manager-venafi.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ .Release.Name }}-csv-reclaim
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: work
+          emptyDir:
+            medium: Memory
+      containers:
+        - name: reclaim
+          image: {{ .Values.csvReclaim.image }}
+          imagePullPolicy: {{ .Values.csvReclaim.imagePullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.csvReclaim.resources | nindent 12 }}
+          volumeMounts:
+            - name: work
+              mountPath: /tmp
+          env:
+            - name: KUBECACHEDIR
+              value: /tmp/.kube/cache
+            - name: NAMESPACE
+              value: {{ required "csvReclaim: namespaces.operator must be set" .Values.namespaces.operator | quote }}
+            - name: SUBSCRIPTION
+              value: {{ required "csvReclaim: operator.packageName must be set" .Values.operator.packageName | quote }}
+            - name: PACKAGE
+              value: {{ required "csvReclaim: operator.packageName must be set" .Values.operator.packageName | quote }}
+            - name: WAIT_SECONDS
+              value: {{ required "csvReclaim: csvReclaim.waitSeconds must be set" .Values.csvReclaim.waitSeconds | quote }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -uo pipefail
+              : "${NAMESPACE:?}" "${SUBSCRIPTION:?}" "${WAIT_SECONDS:?}"
+
+              log()  { printf '[csv-reclaim %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
+              fail() { printf '[csv-reclaim] FAILED: %s\n' "$*" >&2; exit 1; }
+
+              SUBS=subscriptions.operators.coreos.com
+              CSVS=clusterserviceversions.operators.coreos.com
+
+              log "namespace=${NAMESPACE} subscription=${SUBSCRIPTION} budget=${WAIT_SECONDS}s"
+
+              # CHEAP CHECK FIRST: IS THERE ANYTHING THAT COULD EVER BE RECLAIMED?
+              # Measured on a clean install: this Job burned its entire 120s budget waiting for a verdict
+              # that cannot arrive until the approver acts — and the approver runs AFTER it, by design. So
+              # every clean install paid two minutes of dead time for a check that had nothing to check.
+              #
+              # An orphan is a CSV in this namespace that is not an OLM copy, has no ownerReferences and is
+              # referenced by no Subscription. If none exists, there is nothing to reclaim whatever OLM
+              # later decides, and waiting for a verdict cannot change that. Costs one list.
+              CANDIDATE=""
+              for c in $(oc get "$CSVS" -n "$NAMESPACE" -o name 2>/dev/null || true); do
+                [ -n "$c" ] || continue
+                nm="${c##*/}"
+                [ -n "$nm" ] || continue
+                case "$nm" in *"${PACKAGE#openshift-}"*|"${PACKAGE}"*) ;; *) continue ;; esac
+                [ -n "$(oc get "$c" -n "$NAMESPACE" -o jsonpath='{.metadata.labels.olm\.copiedFrom}' 2>/dev/null || true)" ] && continue
+                [ -n "$(oc get "$c" -n "$NAMESPACE" -o jsonpath='{.metadata.ownerReferences}' 2>/dev/null || true)" ] && continue
+                # A CSV OLM IS ACTIVELY WORKING ON IS NOT AN ORPHAN. Measured: an upgrade left the CSV at
+                # phase=Installing with no ownerReferences yet and no Subscription referencing it — so it
+                # matched every orphan test, this Job waited its whole budget for a verdict that OLM had not
+                # published yet, and the hook failed with DeadlineExceeded. Deleting it would have been worse:
+                # it would have torn out an install in progress.
+                #
+                # Only a SETTLED CSV can be an orphan. Succeeded or Failed means OLM has finished with it;
+                # Installing, Pending, Replacing and InstallReady all mean it is mid-flight.
+                ph="$(oc get "$c" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+                case "$ph" in
+                  Succeeded|Failed) ;;
+                  *) log "  ${nm}: phase=${ph:-<none>}, OLM is still working on it — not an orphan"; continue ;;
+                esac
+                ref=""
+                for s in $(oc get "$SUBS" -n "$NAMESPACE" -o name 2>/dev/null || true); do
+                  [ "$(oc get "$s" -n "$NAMESPACE" -o jsonpath='{.status.installedCSV}' 2>/dev/null || true)" = "$nm" ] && ref=yes
+                done
+                [ -n "$ref" ] && continue
+                CANDIDATE="$nm"; break
+              done
+              if [ -z "$CANDIDATE" ]; then
+                log "no unowned, unreferenced, non-copy CSV in ${NAMESPACE} — nothing could be orphaned, not waiting"
+                exit 0
+              fi
+              log "possible orphan present (${CANDIDATE}); confirming with OLM before deleting anything"
+
+              # WAIT FOR OLM TO PUBLISH A VERDICT BEFORE DECIDING. Straight after a sync neither condition
+              # is set, so sampling once would see nothing and skip the reclaim — which is how the sibling
+              # chart silently became dependent on a CronJob happening to fire. Poll until OLM either
+              # reports an installed CSV (healthy, nothing to do) or ResolutionFailed (act).
+              DEADLINE=$(( $(date +%s) + WAIT_SECONDS ))
+              VERDICT=""
+              while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+                if [ -n "$(oc get "$SUBS" "$SUBSCRIPTION" -n "$NAMESPACE" -o jsonpath='{.status.installedCSV}' 2>/dev/null || true)" ]; then
+                  VERDICT=installed; break
+                fi
+                if [ "$(oc get "$SUBS" "$SUBSCRIPTION" -n "$NAMESPACE" -o jsonpath='{range .status.conditions[?(@.type=="ResolutionFailed")]}{.status}{end}' 2>/dev/null || true)" = "True" ]; then
+                  VERDICT=resolution-failed; break
+                fi
+                log "waiting for OLM to report installedCSV or ResolutionFailed ..."
+                sleep 5
+              done
+
+              if [ "$VERDICT" = "installed" ]; then
+                log "OLM reports an installed CSV — nothing orphaned, nothing to do"
+                exit 0
+              fi
+              if [ "$VERDICT" != "resolution-failed" ]; then
+                # No verdict either way inside the budget. Deleting a CSV on no evidence is the one thing
+                # this Job must never do, so it exits 0 and leaves the decision to the approver, which will
+                # report its own timeout with the InstallPlan state.
+                log "OLM published no verdict within ${WAIT_SECONDS}s; taking no action"
+                exit 0
+              fi
+
+              log "Subscription reports ResolutionFailed — looking for an orphaned CSV to clear"
+              # SIX CONDITIONS, ALL REQUIRED, because this deletes something the chart does not own.
+              # Condition 1 (ResolutionFailed) is already established above.
+              RECLAIMED=""
+              for c in $(oc get "$CSVS" -n "$NAMESPACE" -o name 2>/dev/null || true); do
+                [ -n "$c" ] || continue
+                name="${c##*/}"
+                # 3. the name must match this package
+                case "$name" in *"${PACKAGE#openshift-}"*|"${PACKAGE}"*) ;; *) continue ;; esac
+                # 6. NOT an OLM copy. AllNamespaces mode copies the CSV into EVERY namespace, and every
+                #    copy looks unowned and unreferenced. Deleting a copy fights OLM, which recreates it.
+                #    Only the source has an empty olm.copiedFrom, and only the source blocks resolution.
+                copied="$(oc get "$c" -n "$NAMESPACE" -o jsonpath='{.metadata.labels.olm\.copiedFrom}' 2>/dev/null || true)"
+                [ -n "$copied" ] && { log "  ${name}: OLM copy of ${copied}, leaving alone"; continue; }
+                # 4. no ownerReferences — an OLM-managed CSV has an owner, an orphan does not
+                owners="$(oc get "$c" -n "$NAMESPACE" -o jsonpath='{.metadata.ownerReferences}' 2>/dev/null || true)"
+                [ -n "$owners" ] && { log "  ${name}: has ownerReferences, OLM-managed, leaving alone"; continue; }
+                # Settled only — same rule as the candidate scan above, so the two cannot disagree about what
+                # counts as an orphan. Deleting a CSV mid-install tears out work in progress.
+                phase="$(oc get "$c" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+                case "$phase" in
+                  Succeeded|Failed) ;;
+                  *) log "  ${name}: phase=${phase:-<none>}, OLM still working on it, leaving alone"; continue ;;
+                esac
+                # 5. no Subscription reports it as installedCSV
+                referenced=""
+                for s in $(oc get "$SUBS" -n "$NAMESPACE" -o name 2>/dev/null || true); do
+                  [ "$(oc get "$s" -n "$NAMESPACE" -o jsonpath='{.status.installedCSV}' 2>/dev/null || true)" = "$name" ] && referenced=yes
+                done
+                [ -n "$referenced" ] && { log "  ${name}: referenced by a Subscription, leaving alone"; continue; }
+                log "  ${name}: ORPHANED (no owner, unreferenced, not a copy) — deleting so OLM can resolve"
+                # DELETE BY THE FULL `-o name` REFERENCE, and guard the name. The failure that made this
+                # necessary: an upgrade logged only
+                #   error: You must provide one or more resources by argument or filename
+                # which is `oc delete`'s message for a call with NO resource — reached when $name was empty.
+                # `$c` already carries `<type>/<name>` from the list, so using it directly removes the
+                # reassembly step where a name can go missing at all.
+                #
+                # AND NOT THROUGH A PIPE. The old form was `oc delete ... 2>&1 | sed | fail`, where `||`
+                # tests SED's exit status, not oc's — so a failed delete could be reported as a success. That
+                # is the same subshell/exit-status trap the sibling sweeper hit with `printf | while read`.
+                [ -n "$name" ] || fail "internal error: empty CSV name from '${c}' — refusing to run oc delete with no resource"
+                # --wait=false, deliberately. The point is to unblock resolution, and OLM re-resolves once the deletion
+                # is requested; a CSV carries an operators.coreos.com/csv-cleanup finalizer, so waiting adds a
+                # way for this Job to hit its deadline without adding anything.
+                if out="$(oc delete "$c" -n "$NAMESPACE" --wait=false 2>&1)"; then
+                  printf '%s\n' "$out" | sed 's/^/    /'
+                else
+                  printf '%s\n' "$out" | sed 's/^/    /'
+                  fail "could not delete orphaned CSV ${name}: ${out}
+                A Forbidden means this ServiceAccount lacks delete on clusterserviceversions in ${NAMESPACE}."
+                fi
+                RECLAIMED="${RECLAIMED} ${name}"
+              done
+
+              if [ -n "$RECLAIMED" ]; then
+                log "reclaimed:${RECLAIMED} — OLM will re-resolve the Subscription on its own"
+              else
+                # ResolutionFailed with nothing reclaimable is a real problem this Job cannot fix, and
+                # saying so beats letting the approver time out with a less specific message.
+                log "ResolutionFailed, but no CSV here is orphaned — this is not the orphan case"
+                oc get "$SUBS" "$SUBSCRIPTION" -n "$NAMESPACE" \
+                  -o jsonpath='{range .status.conditions[?(@.type=="ResolutionFailed")]}{.message}{end}' 2>/dev/null | sed 's/^/    /'
+                echo
+                log "inspect: oc get ${CSVS} -n ${NAMESPACE}; oc get ${SUBS} ${SUBSCRIPTION} -n ${NAMESPACE} -o yaml"
+              fi
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-csv-reclaim
+  namespace: {{ .Values.namespaces.operator }}
+  labels:
+    {{- include "cert-manager-venafi.labels" . | nindent 4 }}
+  annotations:
+    # Wave -1, so it exists before the Job at wave 0. Ordinary resource, not a hook: Helm never records
+    # hook resources, so hooked RBAC survives an uninstall and never reconciles.
+    argocd.argoproj.io/sync-wave: "-1"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-csv-reclaim
+  namespace: {{ .Values.namespaces.operator }}
+  labels:
+    {{- include "cert-manager-venafi.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+rules:
+  # Read the Subscription's ResolutionFailed condition and installedCSV.
+  - apiGroups: ["operators.coreos.com"]
+    resources: ["subscriptions"]
+    verbs: ["get", "list"]
+  # `delete` is the point of this Job, and it is scoped to this ONE namespace by using a Role rather than a
+  # ClusterRole — an orphaned CSV that blocks resolution is always in the operator's own namespace, and the
+  # OLM copies that must never be touched live in all the others.
+  - apiGroups: ["operators.coreos.com"]
+    resources: ["clusterserviceversions"]
+    verbs: ["get", "list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-csv-reclaim
+  namespace: {{ .Values.namespaces.operator }}
+  labels:
+    {{- include "cert-manager-venafi.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-csv-reclaim
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-csv-reclaim
+    namespace: {{ .Values.namespaces.operator }}
+{{- end }}

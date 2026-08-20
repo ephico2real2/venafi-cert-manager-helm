@@ -6,6 +6,11 @@ metadata:
   namespace: {{ .Values.namespaces.operator }}
   labels:
     {{- include "cert-manager-venafi.labels" . | nindent 4 }}
+  annotations:
+    # Wave -1: before the Subscription, which cannot resolve without an OperatorGroup
+    # in its namespace. ArgoCD deletes in REVERSE wave order, so on removal the
+    # OperatorGroup outlives the Subscription — which is the order OLM wants.
+    argocd.argoproj.io/sync-wave: "-1"
 spec:
   upgradeStrategy: {{ .Values.operator.upgradeStrategy }}
 ---
@@ -16,10 +21,24 @@ metadata:
   namespace: {{ .Values.namespaces.operator }}
   labels:
     {{- include "cert-manager-venafi.labels" . | nindent 4 }}
+  annotations:
+    # Wave 0, and the InstallPlan approver shares it deliberately. With
+    # installPlanApproval: Manual, OLM leaves the first InstallPlan unapproved and
+    # this Subscription reports Progressing — ArgoCD's built-in health check for
+    # operators.coreos.com/Subscription forgives InstallPlanPending/RequiresApproval
+    # ONLY when .status.installedCSV is already set, i.e. an upgrade. On a first
+    # install it is nil, so an approver in any LATER wave would wait on the wave
+    # that is waiting on it. Same wave, and the sync progresses.
+    argocd.argoproj.io/sync-wave: "0"
 spec:
   channel: {{ .Values.operator.channel }}
   installPlanApproval: {{ .Values.operator.installPlanApproval }}
   name: {{ .Values.operator.packageName }}
+  {{- with .Values.operator.startingCSV }}
+  # Pins the version OLM installs. Also the approver's authority: it approves an
+  # InstallPlan only if it installs this exact CSV.
+  startingCSV: {{ . }}
+  {{- end }}
   source: {{ .Values.operator.source }}
   sourceNamespace: {{ .Values.operator.sourceNamespace }}
   {{- if .Values.trustedCA.enabled }}

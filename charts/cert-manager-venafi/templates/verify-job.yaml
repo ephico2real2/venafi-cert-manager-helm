@@ -10,6 +10,14 @@ metadata:
   labels:
     {{- include "cert-manager-venafi.labels" . | nindent 4 }}
   annotations:
+    # Wave 3: after the ca-pull Job (2), before the ClusterIssuer (4) that depends on everything this Job
+    # waits for. Under plain Helm the weight does the ordering; under ArgoCD the wave does.
+    argocd.argoproj.io/sync-wave: "3"
+    # Same reason as the ca-pull Job: with no argocd hook annotation Argo treats this as an ordinary
+    # resource and the second sync fails on the immutable spec.template. HookSucceeded keeps a FAILED
+    # run's pod log, which for a five-stage readiness gate is the only place the reason lives.
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
     "helm.sh/hook": post-install,post-upgrade
     "helm.sh/hook-weight": "5"
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
@@ -53,59 +61,161 @@ spec:
             # emptyDir since the root filesystem is read-only.
             - name: KUBECACHEDIR
               value: /tmp/.kube/cache
+            # `required` on every identifier baked into the script. A misspelled values key renders as an
+            # EMPTY STRING without failing, and an empty identifier does not error either — it makes every
+            # query match nothing, so the Job burns its budget and blames OLM for a typo. The sibling NCO
+            # chart shipped exactly that, reading .Values.subscription.name when the key was packageName.
             - name: OPERATOR_NS
-              value: {{ .Values.namespaces.operator | quote }}
+              value: {{ required "verifyJob: namespaces.operator must be set" .Values.namespaces.operator | quote }}
             - name: OPERAND_NS
-              value: {{ .Values.namespaces.operand | quote }}
+              value: {{ required "verifyJob: namespaces.operand must be set" .Values.namespaces.operand | quote }}
             - name: SUBSCRIPTION
-              value: {{ .Values.operator.packageName | quote }}
+              value: {{ required "verifyJob: operator.packageName must be set" .Values.operator.packageName | quote }}
             - name: TIMEOUT
-              value: {{ .Values.verifyJob.timeoutSeconds | quote }}
+              value: {{ required "verifyJob: verifyJob.timeoutSeconds must be set" .Values.verifyJob.timeoutSeconds | quote }}
+            # So a Forbidden message can print the exact `can-i` probe instead of a guess.
+            - name: SA_NAME
+              value: {{ .Release.Name }}-verify
+{{- if and .Values.verifyJob.checkCredentialsSecret .Values.clusterIssuer.enabled (not .Values.tppCredentials.create) }}
+            # The Secret the ClusterIssuer references but the chart does not create.
+            - name: TPP_SECRET
+              value: {{ required "verifyJob: tppCredentials.secretName must be set" .Values.tppCredentials.secretName | quote }}
+{{- end }}
           command:
             - /bin/bash
             - -c
             - |
-              set -euo pipefail
+              set -uo pipefail
               deadline=$(( $(date +%s) + TIMEOUT ))
-              log() { echo "[verify $(date -u +%H:%M:%S)] $*"; }
+              log()  { echo "[verify $(date -u +%H:%M:%S)] $*"; }
+              fail() { echo "[verify] FAILED: $*" >&2; exit 1; }
               remaining() { local r=$(( deadline - $(date +%s) )); [ "$r" -lt "${1:-15}" ] && r="${1:-15}"; echo "$r"; }
 
-              log "1/5 waiting for Subscription/${SUBSCRIPTION} installedCSV in ${OPERATOR_NS} ..."
+              # EVERY RESOURCE NAMED IN FULL. A plural is not reserved: measured on a live cluster in a
+              # sibling chart, `oc get subscription` bound to subscriptions.messaging.knative.dev and
+              # returned Forbidden — which reads as missing RBAC on the resource you meant. This container
+              # points KUBECACHEDIR at a fresh emptyDir, so discovery is COLD on every run and the binding
+              # is not stable even between two runs of this same Job. A misrouted LIST is worse: it returns
+              # nothing rather than failing, so `oc get deploy` would read as "no operands yet" forever.
+              SUBS=subscriptions.operators.coreos.com
+              CSVS=clusterserviceversions.operators.coreos.com
+              DEPLOYS=deployments.apps
+              CRDS_API=customresourcedefinitions.apiextensions.k8s.io
+              CMOP=certmanagers.operator.openshift.io
+
+              # A FAILED READ IS NOT A NEGATIVE ANSWER. Every `oc get` below keeps its exit status instead of
+              # `2>/dev/null || true`, which collapses "not there yet" (legitimate, keep waiting) together
+              # with "Forbidden" and "wrong namespace" (fatal) into one empty string. The old script then
+              # burned its whole budget and reported "TIMEOUT: no installedCSV", pointing at OLM for what was
+              # an RBAC problem. NotFound during a wait is expected and loops; anything else aborts now.
+              is_notfound() { case "$1" in *NotFound*|*"not found"*) return 0 ;; *) return 1 ;; esac; }
+
+              log "1/6 waiting for Subscription/${SUBSCRIPTION} installedCSV in ${OPERATOR_NS} ..."
               while :; do
-                csv=$(oc get subscription "${SUBSCRIPTION}" -n "${OPERATOR_NS}" -o jsonpath='{.status.installedCSV}' 2>/dev/null || true)
-                [ -n "${csv}" ] && break
-                [ "$(date +%s)" -ge "${deadline}" ] && { log "TIMEOUT: no installedCSV on Subscription"; exit 1; }
+                if out=$(oc get "$SUBS" "${SUBSCRIPTION}" -n "${OPERATOR_NS}" -o jsonpath='{.status.installedCSV}' 2>&1); then
+                  csv="${out}"
+                  [ -n "${csv}" ] && break
+                elif is_notfound "${out}"; then
+                  # The Subscription itself is missing. This Job is a post-install hook at weight 5, so the
+                  # Subscription was applied long before — a NotFound here means OPERATOR_NS or SUBSCRIPTION
+                  # does not match what the chart created, and no amount of waiting fixes that.
+                  fail "Subscription ${SUBSCRIPTION} does not exist in ${OPERATOR_NS}.
+                Check operator.packageName and namespaces.operator against: oc get ${SUBS} -A"
+                else
+                  fail "could not read Subscription ${SUBSCRIPTION} in ${OPERATOR_NS}: ${out}
+                A Forbidden here means this ServiceAccount lacks get on subscriptions in operators.coreos.com.
+                Inspect: oc auth can-i get ${SUBS} -n ${OPERATOR_NS} --as=system:serviceaccount:${OPERATOR_NS}:${SA_NAME}"
+                fi
+                [ "$(date +%s)" -ge "${deadline}" ] && fail "no installedCSV on Subscription/${SUBSCRIPTION} within ${TIMEOUT}s.
+                With installPlanApproval: Manual this usually means the InstallPlan was never approved — check
+                the installplan-approver Job's log, and: oc get installplans.operators.coreos.com -n ${OPERATOR_NS}"
                 sleep 5
               done
               log "    installedCSV=${csv}"
 
-              log "2/5 waiting for CSV/${csv} phase=Succeeded ..."
+              log "2/6 waiting for CSV/${csv} phase=Succeeded ..."
               while :; do
-                phase=$(oc get csv "${csv}" -n "${OPERATOR_NS}" -o jsonpath='{.status.phase}' 2>/dev/null || true)
-                log "    CSV phase=${phase:-<none>}"
+                # A NotFound is legitimate here and loops: the CSV appears only once the InstallPlan
+                # completes. Any OTHER error is fatal and says so.
+                if out=$(oc get "$CSVS" "${csv}" -n "${OPERATOR_NS}" -o jsonpath='{.status.phase}' 2>&1); then
+                  phase="${out}"
+                elif is_notfound "${out}"; then
+                  phase=""
+                else
+                  fail "could not read CSV ${csv} in ${OPERATOR_NS}: ${out}"
+                fi
+                log "    CSV phase=${phase:-<not present yet>}"
                 [ "${phase}" = "Succeeded" ] && break
-                [ "${phase}" = "Failed" ] && { log "CSV reported Failed"; exit 1; }
-                [ "$(date +%s)" -ge "${deadline}" ] && { log "TIMEOUT: CSV not Succeeded (phase=${phase})"; exit 1; }
+                [ "${phase}" = "Failed" ] && fail "CSV ${csv} reported phase=Failed.
+                Inspect: oc describe ${CSVS} ${csv} -n ${OPERATOR_NS}"
+                [ "$(date +%s)" -ge "${deadline}" ] && fail "CSV ${csv} did not reach Succeeded within ${TIMEOUT}s (phase=${phase:-<none>})"
                 sleep 10
               done
 
-              log "3/5 waiting for operand Deployments in ${OPERAND_NS} to be Available ..."
+              log "3/6 waiting for every operand the operator declares to be Available ..."
+              # THE OPERATOR'S OWN VERDICT, not a count of Deployments. This used to be
+              # `[ count -ge 3 ]` against `oc get deploy -n cert-manager`, a number that matched today's
+              # three operands by luck: a version shipping four would satisfy it after three, and one
+              # shipping two would hang to the deadline. It also cannot tell "all three are Available" from
+              # "the first of three exists".
+              #
+              # certmanagers.operator.openshift.io/cluster publishes one condition per component it manages —
+              # measured on a live cluster: cert-manager-controller, cert-manager-webhook and
+              # cert-manager-cainjector, each with Available/Progressing/Degraded. Requiring EVERY
+              # *-deploymentAvailable to be True picks up a fourth component automatically, and a Degraded
+              # component fails fast instead of waiting out the budget.
+              #
+              # The CSV was considered and rejected as the source: its .spec.install.spec.deployments lists
+              # only cert-manager-operator-controller-manager, the operator itself, not the operands.
               while :; do
-                count=$(oc get deploy -n "${OPERAND_NS}" -o name 2>/dev/null | wc -l | tr -d ' ')
-                [ "${count}" -ge 3 ] && break
-                [ "$(date +%s)" -ge "${deadline}" ] && { log "TIMEOUT: expected >=3 operand deployments, found ${count}"; exit 1; }
+                if ! out=$(oc get "$CMOP" cluster -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}' 2>&1); then
+                  if is_notfound "${out}"; then
+                    log "    ${CMOP}/cluster not present yet"
+                    out=""
+                  else
+                    fail "could not read ${CMOP}/cluster: ${out}
+                Inspect: oc auth can-i get ${CMOP} --as=system:serviceaccount:${OPERATOR_NS}:${SA_NAME}"
+                  fi
+                fi
+                avail=$(printf '%s\n' "${out}" | grep -c 'deploymentAvailable=True' || true)
+                total=$(printf '%s\n' "${out}" | grep -c 'deploymentAvailable=' || true)
+                # DEGRADED IS CONTEXT, NOT A VERDICT. An earlier version of this stage failed fast on any
+                # Degraded=True, and a cold-start test proved that wrong twice over. Measured on a live
+                # cluster after reinstalling the operator: all three components reported
+                # deploymentAvailable=True AND deploymentDegraded=True at the same time, with every operand
+                # Deployment 1/1 and the webhook serving admission. The Degraded reason was
+                # `SyncError: (Retrying) trusted CA config map "trusted-ca" doesn't exist` — a condition that
+                # was STALE, still True minutes after the ConfigMap had been recreated, because the operator
+                # had not re-reconciled it yet.
+                #
+                # So Degraded is neither terminal nor necessarily current. Available is the gate; Degraded is
+                # logged so a run that DOES stall explains itself, and it is repeated in the timeout message
+                # where it is genuinely diagnostic.
+                degraded=$(printf '%s\n' "${out}" | grep 'Degraded=True' | head -3 | tr '\n' ' ')
+                [ -n "${degraded}" ] && log "    note: operator reports Degraded (not fatal, often stale): ${degraded}"
+                # EVERY SELECTOR MUST MATCH SOMETHING: total=0 means the condition naming changed, and
+                # treating that as "nothing to wait for" would let this stage pass without checking anything.
+                if [ "${total}" -gt 0 ] && [ "${avail}" -eq "${total}" ]; then
+                  log "    all ${total} operand component(s) Available"
+                  break
+                fi
+                log "    ${avail}/${total:-0} operand component(s) Available"
+                [ "$(date +%s)" -ge "${deadline}" ] && fail "operands not all Available within ${TIMEOUT}s (${avail}/${total:-0}).
+                ${degraded:+Degraded components (this is where that matters): ${degraded}}
+                Inspect: oc get ${CMOP} cluster -o yaml; oc get ${DEPLOYS} -n ${OPERAND_NS}"
                 sleep 5
               done
-              oc wait --for=condition=Available --timeout="$(remaining 30)s" deployment --all -n "${OPERAND_NS}"
 
-              log "4/5 waiting for cert-manager CRDs to be Established ..."
+              log "4/6 waiting for cert-manager CRDs to be Established ..."
               for crd in clusterissuers.cert-manager.io certificates.cert-manager.io; do
                 while :; do
-                  oc get crd "${crd}" >/dev/null 2>&1 && break
-                  [ "$(date +%s)" -ge "${deadline}" ] && { log "TIMEOUT: CRD ${crd} not present"; exit 1; }
+                  oc get "$CRDS_API" "${crd}" >/dev/null 2>&1 && break
+                  [ "$(date +%s)" -ge "${deadline}" ] && fail "CRD ${crd} not present within ${TIMEOUT}s.
+                A Succeeded CSV that did not create this CRD usually means the wrong package is installed."
                   sleep 5
                 done
-                oc wait --for=condition=Established --timeout="$(remaining 15)s" "crd/${crd}"
+                oc wait --for=condition=Established --timeout="$(remaining 15)s" "${CRDS_API}/${crd}" \
+                  || fail "CRD ${crd} did not report Established"
               done
 
               # "Deployment Available" is not "webhook serving admission": on a fresh
@@ -113,7 +223,7 @@ spec:
               # ClusterIssuer create fails with an x509/"webhook.cert-manager.io"
               # error. Probe with a server-dry-run (nothing persisted) until the
               # validating webhook actually accepts a cert-manager resource.
-              log "5/5 waiting for the cert-manager validating webhook to serve admission ..."
+              log "5/6 waiting for the cert-manager validating webhook to serve admission ..."
               PROBE='{"apiVersion":"cert-manager.io/v1","kind":"ClusterIssuer","metadata":{"name":"cmv-webhook-probe"},"spec":{"selfSigned":{}}}'
               while :; do
                 if out=$(printf '%s' "${PROBE}" | oc create --dry-run=server -f - 2>&1); then
@@ -121,9 +231,66 @@ spec:
                   break
                 fi
                 log "    webhook not ready yet: $(printf '%s' "${out}" | tr '\n' ' ' | tail -c 140)"
-                [ "$(date +%s)" -ge "${deadline}" ] && { log "TIMEOUT: webhook not serving admission"; exit 1; }
+                [ "$(date +%s)" -ge "${deadline}" ] && fail "the cert-manager validating webhook was not serving admission within ${TIMEOUT}s.
+                The last rejection is logged above. Inspect: oc get ${DEPLOYS} -n ${OPERAND_NS}; oc logs -n ${OPERAND_NS} deploy/cert-manager-webhook --tail=100"
                 sleep 5
               done
+
+{{- if and .Values.verifyJob.checkCredentialsSecret .Values.clusterIssuer.enabled (not .Values.tppCredentials.create) }}
+              # THE PRE-CREATED CREDENTIAL. tppCredentials.create is false — the chart's default and the safer
+              # one, since a Secret Helm owns can be pruned by Helm — so the ClusterIssuer references a Secret
+              # this chart does not manage. Nothing checked it existed until now: the install succeeded, the
+              # issuer was created, and the failure surfaced later as
+              #   ready=False reason=ErrorSetup: error building client: ... secret "tpp-secret" not found
+              # which is indistinguishable from an unreachable TPP endpoint. Checking here means the install
+              # fails with the actual cause and the command to fix it, before the issuer is created at all.
+              #
+              # THE KEYS ARE CHECKED TOO, not just existence. A Secret with the wrong key names fails at
+              # runtime exactly like a missing one — `oc create secret generic` with the wrong --from-literal
+              # names is an easy mistake and produces an identical ErrorSetup.
+              log "6/6 checking the pre-created TPP credentials Secret ..."
+              # `-o jsonpath={.data}` and parse the keys from the JSON map. An earlier version used
+              # `{range $k, $v := .data}`, which oc's jsonpath implementation rejects outright —
+              # "unrecognized character in action: U+002C". It failed on a secret that was perfectly fine,
+              # and only the error branch stopped that being reported as "not found". Caught by testing the
+              # happy path, which is the branch a check like this is least likely to be run against.
+              if ! out=$(oc get secrets "$TPP_SECRET" -n "$OPERAND_NS" -o jsonpath='{.data}' 2>&1); then
+                if is_notfound "${out}"; then
+                  fail "Secret \"${TPP_SECRET}\" not found in namespace ${OPERAND_NS}.
+                tppCredentials.create is false, so this chart expects the credential to exist already.
+                Create it, or set tppCredentials.create=true and supply the base64 values:
+                  oc create secret generic ${TPP_SECRET} -n ${OPERAND_NS} \\
+                    --from-literal=username=<user> --from-literal=password=<pass>"
+                fi
+                # Not a NotFound, so this is a read failure rather than an absent Secret. Naming only one
+                # possible cause would be a guess: a Forbidden means the RBAC rule is missing, anything else
+                # is quoted verbatim so the reader sees what oc actually said.
+                case "${out}" in
+                  *Forbidden*)
+                    fail "cannot read Secret ${TPP_SECRET} in ${OPERAND_NS}: ${out}
+                The verify ClusterRole is missing its resourceNames-scoped get on secrets. Inspect:
+                  oc auth can-i get secrets/${TPP_SECRET} -n ${OPERAND_NS} --as=system:serviceaccount:${OPERATOR_NS}:${SA_NAME}" ;;
+                  *)
+                    fail "cannot read Secret ${TPP_SECRET} in ${OPERAND_NS}: ${out}" ;;
+                esac
+              fi
+              # ${out} is the JSON map, e.g. {"password":"...","username":"..."}. Match on the quoted KEY
+              # followed by a colon, so a value that happens to contain the word "username" cannot satisfy
+              # this — base64 makes that unlikely but not impossible, and a false pass here means the runtime
+              # ErrorSetup this stage exists to prevent.
+              MISSING=""
+              for k in username password; do
+                case "${out}" in *"\"${k}\":"*) ;; *) MISSING="${MISSING} ${k}" ;; esac
+              done
+              [ -n "$MISSING" ] && fail "Secret ${TPP_SECRET} exists but is missing key(s):${MISSING}
+                cert-manager's Venafi issuer reads the keys 'username' and 'password'; a Secret with other names
+                fails at runtime exactly like a missing one. It currently has: ${out:-<no keys>}
+                Recreate it:
+                  oc delete secret ${TPP_SECRET} -n ${OPERAND_NS}
+                  oc create secret generic ${TPP_SECRET} -n ${OPERAND_NS} \\
+                    --from-literal=username=<user> --from-literal=password=<pass>"
+              log "    ${TPP_SECRET} present with username and password"
+{{- end }}
 
               log "SUCCESS: operator installed, operands Available, CRDs Established, webhook serving — ClusterIssuer may be created"
 {{- end }}

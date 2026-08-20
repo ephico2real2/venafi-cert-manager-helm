@@ -19,9 +19,10 @@ metadata:
   labels:
     {{- include "cert-manager-venafi.labels" . | nindent 4 }}
   annotations:
-    "helm.sh/hook": post-install,post-upgrade
-    "helm.sh/hook-weight": "1"
-    "helm.sh/hook-delete-policy": before-hook-creation
+    # Wave -2, with the Namespaces: this RBAC is a prerequisite of the ca-pull Job, which now runs at
+    # wave -1 alongside the trusted-CA ConfigMap. A Job cannot authenticate with a ServiceAccount that
+    # arrives in a later wave.
+    argocd.argoproj.io/sync-wave: "-2"
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -31,9 +32,10 @@ metadata:
   labels:
     {{- include "cert-manager-venafi.labels" . | nindent 4 }}
   annotations:
-    "helm.sh/hook": post-install,post-upgrade
-    "helm.sh/hook-weight": "1"
-    "helm.sh/hook-delete-policy": before-hook-creation
+    # Wave -2, with the Namespaces: this RBAC is a prerequisite of the ca-pull Job, which now runs at
+    # wave -1 alongside the trusted-CA ConfigMap. A Job cannot authenticate with a ServiceAccount that
+    # arrives in a later wave.
+    argocd.argoproj.io/sync-wave: "-2"
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
@@ -47,9 +49,10 @@ metadata:
   labels:
     {{- include "cert-manager-venafi.labels" . | nindent 4 }}
   annotations:
-    "helm.sh/hook": post-install,post-upgrade
-    "helm.sh/hook-weight": "1"
-    "helm.sh/hook-delete-policy": before-hook-creation
+    # Wave -2, with the Namespaces: this RBAC is a prerequisite of the ca-pull Job, which now runs at
+    # wave -1 alongside the trusted-CA ConfigMap. A Job cannot authenticate with a ServiceAccount that
+    # arrives in a later wave.
+    argocd.argoproj.io/sync-wave: "-2"
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -71,12 +74,31 @@ metadata:
   labels:
     {{- include "cert-manager-venafi.labels" . | nindent 4 }}
   annotations:
+    # WAVE -1 AND HELM WEIGHT -4 — THE SAME POSITION AS THE trusted-CA ConfigMap, deliberately. These two
+    # are alternative ways to obtain the root CA, selected by a flag: pull it from the TPP endpoint with
+    # this Job, or let OpenShift inject the cluster bundle into the labelled ConfigMap. Because they are
+    # interchangeable they must occupy the SAME slot in the ordering — otherwise flipping the flag silently
+    # moves when the CA becomes available, and whichever consumer needed it earlier starts failing.
+    #
+    # Both therefore land before the Subscription (wave 0), so the CA material exists before OLM starts the
+    # operator. This Job talks to the TPP endpoint rather than to cert-manager, so it has nothing to wait
+    # for; its only prerequisite is its own RBAC, moved to wave -2 above.
+    argocd.argoproj.io/sync-wave: "-1"
+    # WITHOUT AN ARGOCD HOOK ANNOTATION THIS IS AN ORDINARY RESOURCE TO ARGOCD, which does not read
+    # helm.sh/hook at all. Argo would re-apply the Job on every sync, and a Job's spec.template is
+    # IMMUTABLE — so the second sync fails with "field is immutable". BeforeHookCreation is what makes
+    # that moot, by deleting the previous run before creating this one.
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
     "helm.sh/hook": post-install,post-upgrade
-    "helm.sh/hook-weight": "3"
+    # Weight -4: the same slot as the ConfigMap alternative, and immediately after the InstallPlan approver
+    # (-5). An ordinary resource like the ConfigMap is applied before ANY hook, so -4 is as close to "the
+    # same position" as a hook can be while still letting the approver go first.
+    "helm.sh/hook-weight": "-4"
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
   backoffLimit: {{ .Values.caPullJob.backoffLimit }}
-  activeDeadlineSeconds: 300
+  activeDeadlineSeconds: {{ add .Values.caPullJob.timeoutSeconds 120 }}
   template:
     metadata:
       labels:

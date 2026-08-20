@@ -10,9 +10,11 @@ metadata:
   labels:
     {{- include "cert-manager-venafi.labels" . | nindent 4 }}
   annotations:
-    "helm.sh/hook": post-install,post-upgrade
-    "helm.sh/hook-weight": "0"
-    "helm.sh/hook-delete-policy": before-hook-creation
+    # Wave 1, and ORDINARY RESOURCES rather than hooks. Helm CREATES hook resources instead of applying
+    # them and never records them in the release, so hooked RBAC survives `helm uninstall`, is never
+    # reconciled on upgrade, and accumulates. Ordinary resources are also applied before any hook runs,
+    # which is precisely the ordering a hook Job needs from its own ServiceAccount.
+    argocd.argoproj.io/sync-wave: "1"
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -21,9 +23,11 @@ metadata:
   labels:
     {{- include "cert-manager-venafi.labels" . | nindent 4 }}
   annotations:
-    "helm.sh/hook": post-install,post-upgrade
-    "helm.sh/hook-weight": "0"
-    "helm.sh/hook-delete-policy": before-hook-creation
+    # Wave 1, and ORDINARY RESOURCES rather than hooks. Helm CREATES hook resources instead of applying
+    # them and never records them in the release, so hooked RBAC survives `helm uninstall`, is never
+    # reconciled on upgrade, and accumulates. Ordinary resources are also applied before any hook runs,
+    # which is precisely the ordering a hook Job needs from its own ServiceAccount.
+    argocd.argoproj.io/sync-wave: "1"
 rules:
   - apiGroups: ["operators.coreos.com"]
     resources: ["subscriptions", "clusterserviceversions"]
@@ -34,12 +38,36 @@ rules:
   - apiGroups: ["apiextensions.k8s.io"]
     resources: ["customresourcedefinitions"]
     verbs: ["get", "list", "watch"]
+  # THE OPERAND READINESS SOURCE OF TRUTH. This CR's status carries one
+  # `<component>-deploymentAvailable` condition per operand the operator manages —
+  # measured on a live cluster: cert-manager-controller, cert-manager-webhook and
+  # cert-manager-cainjector, plus Progressing and Degraded for each. Reading the
+  # operator's own verdict beats counting Deployments in a namespace, which cannot
+  # tell "all three are up" from "the first of three exists", and it picks up a
+  # fourth component automatically if a future version adds one.
+  - apiGroups: ["operator.openshift.io"]
+    resources: ["certmanagers"]
+    verbs: ["get", "list", "watch"]
   # `create` (used only with --dry-run=server) lets the Job probe that the
   # cert-manager validating webhook is actually serving admission before the
   # real ClusterIssuer is created. Nothing is persisted by the dry run.
   - apiGroups: ["cert-manager.io"]
     resources: ["clusterissuers"]
     verbs: ["create"]
+{{- if and .Values.verifyJob.checkCredentialsSecret .Values.clusterIssuer.enabled (not .Values.tppCredentials.create) }}
+  # `get` on exactly the Secrets the ClusterIssuer references, so the gate can confirm a pre-created
+  # credential exists BEFORE the issuer is created. resourceNames works here because both are read by name —
+  # and it is why this is not a blanket read on secrets. Only present when the chart is NOT creating them:
+  # if tppCredentials.create is true the Secret is in the manifest and cannot be missing.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+    resourceNames:
+      - {{ .Values.tppCredentials.secretName | quote }}
+  {{- if .Values.clusterIssuer.venafi.tpp.caBundleSecretRef.enabled }}
+      - {{ .Values.tppCABundle.secretName | quote }}
+  {{- end }}
+{{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -48,9 +76,11 @@ metadata:
   labels:
     {{- include "cert-manager-venafi.labels" . | nindent 4 }}
   annotations:
-    "helm.sh/hook": post-install,post-upgrade
-    "helm.sh/hook-weight": "0"
-    "helm.sh/hook-delete-policy": before-hook-creation
+    # Wave 1, and ORDINARY RESOURCES rather than hooks. Helm CREATES hook resources instead of applying
+    # them and never records them in the release, so hooked RBAC survives `helm uninstall`, is never
+    # reconciled on upgrade, and accumulates. Ordinary resources are also applied before any hook runs,
+    # which is precisely the ordering a hook Job needs from its own ServiceAccount.
+    argocd.argoproj.io/sync-wave: "1"
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole

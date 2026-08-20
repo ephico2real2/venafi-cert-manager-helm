@@ -1,0 +1,197 @@
+name: CI
+
+# Modelled on the sibling group-sync-operator-helm-chart and openshift-rbac-automation workflows, kept to the
+# checks this repo actually needs. This repo had no CI at all, so everything here is new coverage.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+env:
+  CHART: charts/cert-manager-venafi
+
+jobs:
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+
+      - name: helm lint
+        run: helm lint "$CHART"
+
+      - name: Every values combination renders
+        # Both paths for obtaining the root CA, because they are flag-selected alternatives and a change to
+        # one must not break the other.
+        run: |
+          helm template ci "$CHART" >/dev/null
+          helm template ci "$CHART" --set clusterIssuer.venafi.tpp.caBundleSecretRef.enabled=true >/dev/null
+          echo "both combinations render"
+
+      - name: The ClusterIssuer cannot be ungated
+        # clusterIssuer.enabled=true requires verifyJob.enabled=true. Without the gate the issuer renders as
+        # an ORDINARY resource, and ordinary resources are all built before anything is applied — so on a
+        # cluster that does not serve cert-manager.io/v1 yet the install fails outright. That is the manual
+        # two-step this chart used to document, and it must stay impossible to reach by accident.
+        run: |
+          if helm template ci "$CHART" --set verifyJob.enabled=false >/dev/null 2>&1; then
+            echo "::error::clusterIssuer.enabled=true with verifyJob.enabled=false rendered, but it must fail"
+            exit 1
+          fi
+          helm template ci "$CHART" --set verifyJob.enabled=false --set clusterIssuer.enabled=false >/dev/null
+          echo "gate is mandatory, and turning both off still renders"
+
+      - name: The approver cannot run without a pin
+        # The pin IS the approval authority. With nothing to match, the approver would either approve every
+        # InstallPlan the channel produces — defeating installPlanApproval: Manual — or approve none and hang
+        # the install.
+        run: |
+          if helm template ci "$CHART" --set operator.startingCSV=null >/dev/null 2>&1; then
+            echo "::error::installPlanApprover rendered with no operator.startingCSV, but it must fail"
+            exit 1
+          fi
+          echo "approver requires a pinned CSV"
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install pyyaml
+      - name: README documented defaults match values.yaml
+        # Copied in spirit from the sibling group-sync chart, whose own comment records why it exists: a
+        # README row reading `installPlanApproval | Automatic` survived while values.yaml shipped Manual — a
+        # documented default that INVERTED a real control. This repo had no such check, and drifted exactly
+        # the same way: the default was flipped to Manual and the README kept saying Automatic, while two
+        # whole stanzas (csvReclaim, installPlanApprover) went undocumented.
+        run: |
+          python3 - <<'EOF'
+          import re, sys, yaml, pathlib
+          chart = pathlib.Path("charts/cert-manager-venafi")
+          values = yaml.safe_load((chart / "values.yaml").read_text())
+          readme = (chart / "README.md").read_text()
+
+          def dig(path):
+              cur = values
+              for k in path.split("."):
+                  if not isinstance(cur, dict) or k not in cur:
+                      return "<<absent>>"
+                  cur = cur[k]
+              return cur
+
+          bad, checked = [], 0
+          # | `key` | type | default | description |  — column 3 is the default. Reading column 2 by
+          # mistake compares "bool" against True and reports every row as broken; that was a real
+          # false-positive run while writing this.
+          for line in readme.splitlines():
+              m = re.match(r"^\|\s*`([a-zA-Z][\w.]*\.[\w.]+)`\s*\|[^|]*\|\s*([^|]*?)\s*\|", line)
+              if not m:
+                  continue
+              key, doc = m.group(1), m.group(2).strip().strip("`")
+              actual = dig(key)
+              if actual == "<<absent>>":
+                  bad.append(f"{key}: documented but absent from values.yaml"); continue
+              # Prose defaults for object-valued keys ("128Mi-512Mi mem") cannot be compared to a dict.
+              if isinstance(actual, dict) or doc in ("", "-", "(none)", "''", '""'):
+                  continue
+              checked += 1
+              a = str(actual).lower() if isinstance(actual, bool) else str(actual)
+              if a.lower() != doc.lower().strip("'\""):
+                  bad.append(f"{key}: README says {doc!r}, values.yaml has {actual!r}")
+
+          # Every top-level stanza must appear somewhere in the README.
+          for k in values:
+              if k not in readme:
+                  bad.append(f"{k}: top-level values stanza is undocumented")
+
+          # EVERY SELECTOR MUST MATCH SOMETHING: zero rows compared would pass forever.
+          if checked == 0:
+              bad.append("no comparable parameter rows found — the table format changed and this check "
+                         "stopped covering anything")
+
+          for b in bad:
+              print(f"::error::{b}")
+          print(f"compared {checked} documented default(s), {len(bad)} problem(s)")
+          sys.exit(1 if bad else 0)
+          EOF
+
+  ordering:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: pip install pyyaml
+      - name: Ordering is declared, not accidental
+        run: ci/ordering.py
+
+      - name: Every oc call names its resource in full
+        # A resource plural is not reserved, so a short name can bind to a DIFFERENT API GROUP. Measured on a
+        # live cluster in the sibling chart: `oc get subscription` resolved to
+        # subscriptions.messaging.knative.dev and returned Forbidden. These Jobs point KUBECACHEDIR at a fresh
+        # emptyDir, so discovery is cold every run and the binding is not stable between two runs of the same
+        # Job. A misrouted LIST returns nothing rather than failing — and the csv-reclaim Job lists CSVs to
+        # decide what to DELETE.
+        run: ci/qualified-resources.py
+
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: pip install pyyaml
+
+      - name: Shell syntax — the scripts as they will actually run
+        # Extracted from the RENDER, not from the templates, because these scripts are inline in each Job's
+        # container command and a Go template can produce syntactically invalid bash from valid-looking YAML.
+        run: |
+          python3 - <<'EOF'
+          import subprocess, sys, tempfile, os, yaml
+          bad = 0
+          seen = 0
+          for extra in ([], ["--set", "clusterIssuer.venafi.tpp.caBundleSecretRef.enabled=true"]):
+              out = subprocess.run(["helm", "template", "ci", os.environ["CHART"]] + extra,
+                                   capture_output=True, text=True, check=True).stdout
+              for d in yaml.safe_load_all(out):
+                  if not d or d.get("kind") != "Job":
+                      continue
+                  for c in d["spec"]["template"]["spec"]["containers"]:
+                      for part in (c.get("command") or []):
+                          if "\n" not in part:
+                              continue
+                          seen += 1
+                          with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as fh:
+                              fh.write(part)
+                          r = subprocess.run(["bash", "-n", fh.name], capture_output=True, text=True)
+                          os.unlink(fh.name)
+                          if r.returncode != 0:
+                              print("::error::%s/%s: %s" % (d["metadata"]["name"], c["name"], r.stderr.strip()))
+                              bad += 1
+          # EVERY SELECTOR MUST MATCH SOMETHING: zero scripts checked would pass forever while testing nothing.
+          if seen == 0:
+              print("::error::no inline Job scripts found — this check stopped covering anything")
+              bad += 1
+          print("checked %d inline script(s), %d problem(s)" % (seen, bad))
+          sys.exit(1 if bad else 0)
+          EOF
+
+      - name: Repo helper scripts parse
+        run: for f in scripts/*.sh; do bash -n "$f" || exit 1; done; echo "scripts/*.sh OK"
+
+  version-bump:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: A change under charts/ requires a new Chart.yaml version
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if git diff --quiet "$BASE" -- "$CHART"; then
+            echo "chart unchanged — no bump needed"; exit 0
+          fi
+          old=$(git show "$BASE:$CHART/Chart.yaml" 2>/dev/null | awk '/^version:/{print $2}')
+          new=$(awk '/^version:/{print $2}' "$CHART/Chart.yaml")
+          echo "chart changed: $old -> $new"
+          [ "$old" != "$new" ] || { echo "::error::$CHART changed but version is still $new"; exit 1; }
