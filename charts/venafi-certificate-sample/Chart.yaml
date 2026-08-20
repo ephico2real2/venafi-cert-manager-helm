@@ -5,7 +5,7 @@ description: >-
   ClusterIssuer by creating a cert-manager Certificate resource. This is the
   only object a tenant manages; cert-manager handles issuance and renewal.
 type: application
-version: 0.1.0
+version: 0.1.1
 appVersion: "1.0.0"
 keywords:
   - cert-manager

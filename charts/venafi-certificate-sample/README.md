@@ -1,5 +1,8 @@
 # venafi-certificate-sample
 
+<!-- Links outside this directory are ABSOLUTE on purpose: this README ships INSIDE the packaged chart,
+     where ../ resolves to nothing. A relative link that works on GitHub is dead once the chart is pulled. -->
+
 ## Install from the chart repository
 
 ```bash
@@ -15,7 +18,7 @@ repository — a tenant only manages the `Certificate` here, never the TPP crede
 
 A tenant-facing sample that **validates** the Venafi integration end-to-end: it
 creates a namespaced `Certificate` that requests a real cert from the shared
-`ClusterIssuer` installed by the [`cert-manager-venafi`](../cert-manager-venafi)
+`ClusterIssuer` installed by the [`cert-manager-venafi`](https://github.com/ephico2real2/venafi-cert-manager-helm/blob/main/charts/cert-manager-venafi)
 chart. This is the only object a tenant manages — cert-manager handles issuance
 and renewal.
 
@@ -104,10 +107,10 @@ helm install my-cert . -n <your-namespace> --create-namespace \
 
 ## References
 
-- Design reasoning & full walkthrough: [`steps.md`](../../steps.md) ·
-  [top-level charts README](../README.md)
+- Design reasoning & full walkthrough: [`steps.md`](https://github.com/ephico2real2/venafi-cert-manager-helm/blob/main/steps.md) ·
+  [top-level charts README](https://github.com/ephico2real2/venafi-cert-manager-helm/blob/main/charts/README.md)
 - Integration chart (the `ClusterIssuer` this references):
-  [`cert-manager-venafi`](../cert-manager-venafi)
+  [`cert-manager-venafi`](https://github.com/ephico2real2/venafi-cert-manager-helm/blob/main/charts/cert-manager-venafi)
 - **Upstream cert-manager** — Certificate resources & Venafi issuer:
   <https://cert-manager.io/v1.6-docs/configuration/venafi/>
 - **Red Hat** — cert-manager Operator for OpenShift:
