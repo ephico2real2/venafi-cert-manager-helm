@@ -21,6 +21,14 @@ metadata:
     # This ConfigMap has no dependencies of its own: OpenShift's network operator fills ca-bundle.crt from
     # the label below. So there is no reason for it to wait for anything.
     argocd.argoproj.io/sync-wave: "-1"
+    # The operator writes data.ca-bundle.crt here; the chart deliberately ships it empty.
+    # Server-side apply lets the operator keep ownership of what it wrote instead of Argo
+    # reverting it on every sync — which would empty the bundle and make every external
+    # cluster unreachable until the operator refilled it.
+    #
+    # NOT sufficient on its own: the Application also needs an ignoreDifferences entry for
+    # this ConfigMap's `data`. That cannot be set from here — see the chart README.
+    argocd.argoproj.io/sync-options: ServerSideApply=true
   labels:
     config.openshift.io/inject-trusted-cabundle: "true"
     {{- include "cert-manager-venafi.labels" . | nindent 4 }}

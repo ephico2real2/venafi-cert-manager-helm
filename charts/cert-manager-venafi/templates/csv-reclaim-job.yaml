@@ -97,6 +97,33 @@ spec:
 
               log "namespace=${NAMESPACE} subscription=${SUBSCRIPTION} budget=${WAIT_SECONDS}s"
 
+              # CHEAP CHECK FIRST: IS THERE ANYTHING THAT COULD EVER BE RECLAIMED?
+              # Measured on a clean install: this Job burned its entire 120s budget waiting for a verdict
+              # that cannot arrive until the approver acts — and the approver runs AFTER it, by design. So
+              # every clean install paid two minutes of dead time for a check that had nothing to check.
+              #
+              # An orphan is a CSV in this namespace that is not an OLM copy, has no ownerReferences and is
+              # referenced by no Subscription. If none exists, there is nothing to reclaim whatever OLM
+              # later decides, and waiting for a verdict cannot change that. Costs one list.
+              CANDIDATE=""
+              for c in $(oc get "$CSVS" -n "$NAMESPACE" -o name 2>/dev/null || true); do
+                nm="${c##*/}"
+                case "$nm" in *"${PACKAGE#openshift-}"*|"${PACKAGE}"*) ;; *) continue ;; esac
+                [ -n "$(oc get "$c" -n "$NAMESPACE" -o jsonpath='{.metadata.labels.olm\.copiedFrom}' 2>/dev/null || true)" ] && continue
+                [ -n "$(oc get "$c" -n "$NAMESPACE" -o jsonpath='{.metadata.ownerReferences}' 2>/dev/null || true)" ] && continue
+                ref=""
+                for s in $(oc get "$SUBS" -n "$NAMESPACE" -o name 2>/dev/null || true); do
+                  [ "$(oc get "$s" -n "$NAMESPACE" -o jsonpath='{.status.installedCSV}' 2>/dev/null || true)" = "$nm" ] && ref=yes
+                done
+                [ -n "$ref" ] && continue
+                CANDIDATE="$nm"; break
+              done
+              if [ -z "$CANDIDATE" ]; then
+                log "no unowned, unreferenced, non-copy CSV in ${NAMESPACE} — nothing could be orphaned, not waiting"
+                exit 0
+              fi
+              log "possible orphan present (${CANDIDATE}); confirming with OLM before deleting anything"
+
               # WAIT FOR OLM TO PUBLISH A VERDICT BEFORE DECIDING. Straight after a sync neither condition
               # is set, so sampling once would see nothing and skip the reclaim — which is how the sibling
               # chart silently became dependent on a CronJob happening to fire. Poll until OLM either
