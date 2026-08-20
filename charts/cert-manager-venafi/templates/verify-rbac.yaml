@@ -38,6 +38,16 @@ rules:
   - apiGroups: ["apiextensions.k8s.io"]
     resources: ["customresourcedefinitions"]
     verbs: ["get", "list", "watch"]
+  # THE OPERAND READINESS SOURCE OF TRUTH. This CR's status carries one
+  # `<component>-deploymentAvailable` condition per operand the operator manages —
+  # measured on a live cluster: cert-manager-controller, cert-manager-webhook and
+  # cert-manager-cainjector, plus Progressing and Degraded for each. Reading the
+  # operator's own verdict beats counting Deployments in a namespace, which cannot
+  # tell "all three are up" from "the first of three exists", and it picks up a
+  # fourth component automatically if a future version adds one.
+  - apiGroups: ["operator.openshift.io"]
+    resources: ["certmanagers"]
+    verbs: ["get", "list", "watch"]
   # `create` (used only with --dry-run=server) lets the Job probe that the
   # cert-manager validating webhook is actually serving admission before the
   # real ClusterIssuer is created. Nothing is persisted by the dry run.

@@ -145,6 +145,11 @@ tppCABundle:
 # -----------------------------------------------------------------------------
 caPullJob:
   enabled: true
+  # Wait budget for the TLS handshake and PEM extraction. activeDeadlineSeconds on the Job is this + 120,
+  # so the script's own message wins over a silent kubelet kill. It used to be a hardcoded 300 on the Job
+  # while the verify Job derived its own — raise the budget there and the kubelet still killed the pod at
+  # 300s, part-way, with no message of its own, which is the least debuggable way for a Job to fail.
+  timeoutSeconds: 180
   # Image must provide openssl + oc (the ose-cli image has both).
   image: registry.redhat.io/openshift4/ose-cli:latest
   imagePullPolicy: IfNotPresent
