@@ -39,12 +39,58 @@ operator:
   packageName: openshift-cert-manager-operator
   source: redhat-operators
   sourceNamespace: openshift-marketplace
-  # PARAMETERIZED per request. Automatic  = OLM approves & applies InstallPlans
-  # as they appear (hands-off upgrades within the channel). Manual = an admin
-  # must approve each InstallPlan before it is applied (change-controlled envs).
-  installPlanApproval: Automatic
+  # Manual, deliberately, and paired with startingCSV below. Automatic means OLM
+  # approves and applies EVERY InstallPlan the channel produces — and stable-v1 is
+  # a ROLLING channel, so when v1.20 is published it installs itself, on a cluster
+  # that issues certificates, with no change in git and nobody's review.
+  #
+  # Manual on its own would block the FIRST install too: OLM stages an unapproved
+  # InstallPlan and waits for a human. The installPlanApprover Job below closes
+  # that, by approving ONLY the pinned version — so the version this chart declares
+  # installs unattended and anything else waits for a person.
+  installPlanApproval: Manual
+  # THE APPROVAL AUTHORITY. The approver approves an InstallPlan only if it installs
+  # exactly this CSV, so adopting a new version is a reviewable values change here
+  # rather than something OLM did overnight.
+  #
+  # Note the CSV name does NOT begin with packageName — the package is
+  # `openshift-cert-manager-operator` and the CSV is `cert-manager-operator.vX.Y.Z`.
+  # That is why the approver reads .status.installedCSV instead of prefix-matching.
+  #
+  # To move version: bump this, review the diff, merge. `oc get packagemanifest
+  # openshift-cert-manager-operator -n openshift-marketplace -o jsonpath=
+  # '{range .status.channels[*]}{.name}{" -> "}{.currentCSV}{"\n"}{end}'` lists what
+  # each channel currently offers.
+  startingCSV: cert-manager-operator.v1.19.1
   # OperatorGroup upgrade strategy. "Default" preserves OLM's standard behavior.
   upgradeStrategy: Default
+
+# -----------------------------------------------------------------------------
+# InstallPlan approver
+# Approves ONLY the InstallPlan that installs operator.startingCSV, so a
+# Manual-approval Subscription still installs unattended while a channel upgrade
+# waits for a human. Disable only if something else approves InstallPlans for you
+# — with installPlanApproval: Manual and no approver, the first install hangs.
+# -----------------------------------------------------------------------------
+installPlanApprover:
+  enabled: true
+  # Same image as the verify Job: it only needs `oc`.
+  image: registry.redhat.io/openshift4/ose-cli:latest
+  imagePullPolicy: IfNotPresent
+  # How long to wait for OLM to stage an InstallPlan for the pinned CSV, and then
+  # for that plan to complete. ONE budget for both, as with the verify Job.
+  waitSeconds: 600
+  # 0: every attempt polls the same state, so a retry re-waits from zero and turns
+  # one 10-minute failure into two with no new information.
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
 
 # -----------------------------------------------------------------------------
 # TPP secrets

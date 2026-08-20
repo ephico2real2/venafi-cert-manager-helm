@@ -1,0 +1,254 @@
+{{- if and .Values.operator.enabled .Values.installPlanApprover.enabled }}
+{{- if not .Values.operator.startingCSV }}
+{{- fail "installPlanApprover is enabled but operator.startingCSV is empty. The pin IS the approval authority — with nothing to match, the approver would either approve every InstallPlan the channel produces (defeating installPlanApproval: Manual) or approve none (hanging the install). Set operator.startingCSV, or set installPlanApprover.enabled=false and approve InstallPlans by another route." }}
+{{- end }}
+# Approves ONLY the InstallPlan that installs operator.startingCSV.
+#
+# WHY IT EXISTS. installPlanApproval: Manual is the upgrade gate we want — a rolling channel must not install
+# a new operator version onto a certificate-issuing cluster unreviewed. But Manual also blocks the FIRST
+# install: OLM stages an unapproved InstallPlan and waits for a human, so an unattended `helm install` never
+# completes and the verify Job (weight 5) times out waiting for a CSV that will never appear. Approving only
+# the pinned version gives both halves.
+#
+# ORDERING, and the two mechanisms are not interchangeable:
+#
+#   helm.sh/hook-weight: -5     the FIRST hook to run. The verify Job at weight 5 waits for
+#                               .status.installedCSV, which never appears until this approval happens, so
+#                               anything that gates on the operator must come after this.
+#   argocd sync-wave: 0         the SUBSCRIPTION'S OWN WAVE, deliberately. ArgoCD advances a wave only when
+#                               it is healthy, and a Manual-approval Subscription reports Progressing until
+#                               its InstallPlan is approved. ArgoCD's built-in health check for
+#                               operators.coreos.com/Subscription forgives InstallPlanPending/RequiresApproval
+#                               only when .status.installedCSV is already set — an UPGRADE awaiting approval.
+#                               On a first install it is nil, so at wave 1 this Job would wait on the wave
+#                               that is waiting on it, and the docs name the outcome: "it may be that the app
+#                               can never get to healthy."
+#   argocd hook: Sync           NOT PostSync, which runs only after the whole sync succeeds and all resources
+#                               are Healthy — unreachable while the Subscription is Progressing for want of
+#                               this very approval. And without ANY argocd hook annotation a Helm-hook Job is
+#                               an ordinary resource to ArgoCD, re-applied every sync, which fails on the
+#                               second one because a Job's spec.template is immutable.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-installplan-approver
+  namespace: {{ .Values.namespaces.operator }}
+  labels:
+    {{- include "cert-manager-venafi.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/hook: Sync
+    # BeforeHookCreation is what makes the immutable spec.template moot: the previous run is deleted before
+    # this one is created. HookSucceeded keeps a FAILED run's pod log, which is the only place the reason
+    # lives.
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: {{ .Values.installPlanApprover.backoffLimit }}
+  # Above the script's own budget, so the script's message is the one you read rather than the kubelet
+  # killing the pod part-way with no explanation of its own.
+  activeDeadlineSeconds: {{ add .Values.installPlanApprover.waitSeconds 120 }}
+  ttlSecondsAfterFinished: {{ .Values.installPlanApprover.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels:
+        {{- include "cert-manager-venafi.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ .Release.Name }}-installplan-approver
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: work
+          emptyDir:
+            medium: Memory
+      containers:
+        - name: approve
+          image: {{ .Values.installPlanApprover.image }}
+          imagePullPolicy: {{ .Values.installPlanApprover.imagePullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.installPlanApprover.resources | nindent 12 }}
+          volumeMounts:
+            - name: work
+              mountPath: /tmp
+          env:
+            # oc writes its discovery and OpenAPI cache here; the root filesystem is read-only.
+            - name: KUBECACHEDIR
+              value: /tmp/.kube/cache
+            # `required` on every identifier baked into the script below. A misspelled values key renders as
+            # an EMPTY STRING and does not fail — and an empty identifier does not error either, it simply
+            # makes every query match nothing. The Job then burns its whole budget and reports "no InstallPlan
+            # for the pinned CSV", which reads as an OLM problem. The sibling NCO chart shipped exactly that:
+            # a readiness Job read .Values.subscription.name when the key was packageName, and cost five
+            # minutes and a wrong diagnosis. `required` turns the same typo into a render-time error naming
+            # the key.
+            - name: NAMESPACE
+              value: {{ required "installPlanApprover: namespaces.operator must be set" .Values.namespaces.operator | quote }}
+            - name: SUBSCRIPTION
+              value: {{ required "installPlanApprover: operator.packageName must be set" .Values.operator.packageName | quote }}
+            - name: APPROVE_CSV
+              value: {{ required "installPlanApprover: operator.startingCSV must be set" .Values.operator.startingCSV | quote }}
+            # The Job's own ServiceAccount, so a Forbidden message can print the exact `can-i` probe
+            # rather than a guess. It is not the Subscription name — an earlier draft used that and would
+            # have sent a reader to check permissions for an account that does not exist.
+            - name: SA_NAME
+              value: {{ .Release.Name }}-installplan-approver
+            - name: WAIT_SECONDS
+              value: {{ required "installPlanApprover: installPlanApprover.waitSeconds must be set" .Values.installPlanApprover.waitSeconds | quote }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              # No `set -e`: every failure below reports the command to run next, which is more use than an
+              # exit code. `set -u` still catches an unset variable, and pipefail a broken pipeline.
+              set -uo pipefail
+
+              : "${NAMESPACE:?}" "${SUBSCRIPTION:?}" "${APPROVE_CSV:?}" "${WAIT_SECONDS:?}" "${SA_NAME:?}"
+
+              log()  { printf '[approver %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
+              fail() { printf '[approver] FAILED: %s\n' "$*" >&2; exit 1; }
+
+              # ONE budget for the whole script, not one per stage. Two loops each free to consume
+              # WAIT_SECONDS would total 2x the documented number, at which point activeDeadlineSeconds kills
+              # the pod part-way with no message of its own.
+              DEADLINE=$(( $(date +%s) + WAIT_SECONDS ))
+              out_of_time() { [ "$(date +%s)" -ge "$DEADLINE" ]; }
+
+              # EVERY RESOURCE NAMED IN FULL. A plural is not reserved: measured on a live cluster in a
+              # sibling chart, `oc get subscription` bound to subscriptions.messaging.knative.dev and returned
+              # Forbidden, which reads as missing RBAC on the resource you meant. This container points
+              # KUBECACHEDIR at a fresh emptyDir, so discovery is COLD on every run and the binding is not
+              # stable even between two runs of this same Job.
+              SUBS=subscriptions.operators.coreos.com
+              PLANS=installplans.operators.coreos.com
+              CSVS=clusterserviceversions.operators.coreos.com
+
+              log "namespace=${NAMESPACE} subscription=${SUBSCRIPTION} approving-only=${APPROVE_CSV} budget=${WAIT_SECONDS}s"
+
+              # --- 1. is approval even ours to do? ------------------------------------------------------
+              # AN EMPTY READ IS NOT "Automatic". `-o jsonpath ... 2>/dev/null || true` collapses three
+              # different states into one empty string: the field genuinely absent (OLM defaults to Automatic
+              # — nothing to do), the Subscription not there (this hook ran before the resource it depends
+              # on), and the read failing (Forbidden, a wrong namespace, an API timeout). Only the first is
+              # "nothing to do"; reporting the other two as a successful no-op means the operator never
+              # installs and the log points AWAY from the cause. Keep the exit status and branch on it.
+              if ! MODE="$(oc get "$SUBS" "$SUBSCRIPTION" -n "$NAMESPACE" -o jsonpath='{.spec.installPlanApproval}' 2>&1)"; then
+                case "$MODE" in
+                  *NotFound*|*"not found"*)
+                    fail "Subscription ${SUBSCRIPTION} does not exist in ${NAMESPACE}.
+                This Job runs at helm hook-weight -5 and ArgoCD sync-wave 0, both AFTER the Subscription is applied, so
+                if it is missing then operator.packageName does not match the Subscription this chart creates, or the
+                release was applied with operator.enabled=false.
+                Inspect: oc get ${SUBS} -n ${NAMESPACE}" ;;
+                  *)
+                    fail "could not read Subscription ${SUBSCRIPTION} in ${NAMESPACE}: ${MODE}
+                The resource is named in full, so a Forbidden here means this ServiceAccount lacks 'get' on
+                subscriptions in the operators.coreos.com group.
+                          Inspect: oc auth can-i get ${SUBS} -n ${NAMESPACE} --as=system:serviceaccount:${NAMESPACE}:${SA_NAME}" ;;
+                esac
+              fi
+              if [ "$MODE" != "Manual" ]; then
+                log "approval mode is '${MODE:-Automatic (field absent)}', not Manual — OLM approves its own InstallPlans. Nothing to do."
+                exit 0
+              fi
+
+              # Reports any unapproved InstallPlan this Job will NOT approve, and why. Deliberately never
+              # silent: refusing a plan for an unpinned version is the entire point of the gate, but a
+              # refusal nobody logs is indistinguishable from an approver that failed to notice — which is
+              # exactly how it was reported in the sibling chart.
+              report_unapproved_others() {
+                local found=0 ip owner approved names
+                for ip in $(oc get "$PLANS" -n "$NAMESPACE" -o name 2>/dev/null || true); do
+                  owner="$(oc get "$ip" -n "$NAMESPACE" -o jsonpath='{.metadata.ownerReferences[?(@.kind=="Subscription")].name}' 2>/dev/null || true)"
+                  case " $owner " in *" $SUBSCRIPTION "*) ;; *) continue ;; esac
+                  approved="$(oc get "$ip" -n "$NAMESPACE" -o jsonpath='{.spec.approved}' 2>/dev/null || true)"
+                  [ "$approved" = "true" ] && continue
+                  names="$(oc get "$ip" -n "$NAMESPACE" -o jsonpath='{.spec.clusterServiceVersionNames[*]}' 2>/dev/null || true)"
+                  case " $names " in
+                    *" $APPROVE_CSV "*) ;;
+                    *) found=1
+                       log "PENDING UPGRADE, deliberately NOT approved: ${ip} installs [${names}]."
+                       log "  The pin is the approval authority — this Job only ever approves ${APPROVE_CSV}, so a"
+                       log "  channel upgrade cannot install itself onto a cluster that is issuing certificates."
+                       log "  To adopt it: bump operator.startingCSV to the version above, review, merge." ;;
+                  esac
+                done
+                [ "$found" = 0 ] && log "no other unapproved InstallPlans are waiting"
+                return 0
+              }
+
+              # --- 2. already at the pin? --------------------------------------------------------------
+              INSTALLED="$(oc get "$SUBS" "$SUBSCRIPTION" -n "$NAMESPACE" -o jsonpath='{.status.installedCSV}' 2>/dev/null || true)"
+              if [ "$INSTALLED" = "$APPROVE_CSV" ]; then
+                log "already installed at ${APPROVE_CSV}; no InstallPlan to approve"
+                # Before the search loop, which is the only other place a non-matching plan gets logged. In
+                # the steady state — installed at the pin, an upgrade waiting in the channel — skipping this
+                # would make a deliberate refusal look like an oversight.
+                report_unapproved_others
+                exit 0
+              fi
+              log "installedCSV=${INSTALLED:-<none yet>}"
+
+              # --- 3. find the plan for the pinned CSV, owned by OUR Subscription ---------------------
+              # Ownership matters: several operators can share a namespace, and approving another operator's
+              # InstallPlan would install software this chart knows nothing about.
+              echo "=== Waiting for an unapproved InstallPlan that installs ${APPROVE_CSV} ==="
+              TARGET=""
+              while :; do
+                for ip in $(oc get "$PLANS" -n "$NAMESPACE" -o name 2>/dev/null || true); do
+                  owner="$(oc get "$ip" -n "$NAMESPACE" -o jsonpath='{.metadata.ownerReferences[?(@.kind=="Subscription")].name}' 2>/dev/null || true)"
+                  case " $owner " in *" $SUBSCRIPTION "*) ;; *) continue ;; esac
+                  approved="$(oc get "$ip" -n "$NAMESPACE" -o jsonpath='{.spec.approved}' 2>/dev/null || true)"
+                  [ "$approved" = "true" ] && continue
+                  names="$(oc get "$ip" -n "$NAMESPACE" -o jsonpath='{.spec.clusterServiceVersionNames[*]}' 2>/dev/null || true)"
+                  case " $names " in
+                    *" $APPROVE_CSV "*) TARGET="$ip"; log "match: ${ip} installs [${names}]"; break ;;
+                    *) log "SKIP ${ip}: installs [${names}], not the pinned ${APPROVE_CSV} — left for a human" ;;
+                  esac
+                done
+                [ -n "$TARGET" ] && break
+                out_of_time && break
+                log "waiting for OLM to stage an InstallPlan for ${APPROVE_CSV} ..."
+                sleep 5
+              done
+              [ -n "$TARGET" ] || fail "no unapproved InstallPlan for ${APPROVE_CSV} appeared within ${WAIT_SECONDS}s.
+                Most often operator.startingCSV names a version this channel does not offer. Check what it does:
+                oc get packagemanifest ${SUBSCRIPTION} -n {{ .Values.operator.sourceNamespace }} \\
+                -o jsonpath='{range .status.channels[*]}{.name}{\" -> \"}{.currentCSV}{\"\\n\"}{end}'
+                And what OLM staged:  oc get ${PLANS} -n ${NAMESPACE} -o custom-columns=NAME:.metadata.name,CSV:.spec.clusterServiceVersionNames[*],APPROVED:.spec.approved"
+
+              # --- 4. approve it ----------------------------------------------------------------------
+              log "approving ${TARGET}"
+              oc patch "$TARGET" -n "$NAMESPACE" --type merge -p '{"spec":{"approved":true}}' \
+                || fail "could not patch ${TARGET}. A Forbidden here means the Role lacks 'patch' on installplans.
+                Inspect: oc auth can-i patch ${PLANS} -n ${NAMESPACE}"
+
+              # --- 5. confirm it actually installed ---------------------------------------------------
+              # The patch returning is not the operator being installed. Reporting success at that point is
+              # how a gate becomes decorative.
+              echo "=== Waiting for ${APPROVE_CSV} to reach Succeeded ==="
+              PHASE=""
+              while :; do
+                PHASE="$(oc get "$CSVS" "$APPROVE_CSV" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+                [ "$PHASE" = "Succeeded" ] && break
+                [ "$PHASE" = "Failed" ] && fail "${APPROVE_CSV} reported phase=Failed.
+                Inspect: oc describe ${CSVS} ${APPROVE_CSV} -n ${NAMESPACE}"
+                out_of_time && break
+                log "csv phase=${PHASE:-<not present yet>}"
+                sleep 5
+              done
+              [ "$PHASE" = "Succeeded" ] || fail "${APPROVE_CSV} did not reach Succeeded within ${WAIT_SECONDS}s (phase=${PHASE:-<none>}).
+                Inspect: oc get ${CSVS},${PLANS} -n ${NAMESPACE}"
+
+              log "OK: ${APPROVE_CSV} approved via ${TARGET} and installed"
+              report_unapproved_others
+{{- end }}
