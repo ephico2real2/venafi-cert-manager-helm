@@ -76,6 +76,11 @@ spec:
             # So a Forbidden message can print the exact `can-i` probe instead of a guess.
             - name: SA_NAME
               value: {{ .Release.Name }}-verify
+{{- if and .Values.verifyJob.checkCredentialsSecret .Values.clusterIssuer.enabled (not .Values.tppCredentials.create) }}
+            # The Secret the ClusterIssuer references but the chart does not create.
+            - name: TPP_SECRET
+              value: {{ required "verifyJob: tppCredentials.secretName must be set" .Values.tppCredentials.secretName | quote }}
+{{- end }}
           command:
             - /bin/bash
             - -c
@@ -105,7 +110,7 @@ spec:
               # an RBAC problem. NotFound during a wait is expected and loops; anything else aborts now.
               is_notfound() { case "$1" in *NotFound*|*"not found"*) return 0 ;; *) return 1 ;; esac; }
 
-              log "1/5 waiting for Subscription/${SUBSCRIPTION} installedCSV in ${OPERATOR_NS} ..."
+              log "1/6 waiting for Subscription/${SUBSCRIPTION} installedCSV in ${OPERATOR_NS} ..."
               while :; do
                 if out=$(oc get "$SUBS" "${SUBSCRIPTION}" -n "${OPERATOR_NS}" -o jsonpath='{.status.installedCSV}' 2>&1); then
                   csv="${out}"
@@ -128,7 +133,7 @@ spec:
               done
               log "    installedCSV=${csv}"
 
-              log "2/5 waiting for CSV/${csv} phase=Succeeded ..."
+              log "2/6 waiting for CSV/${csv} phase=Succeeded ..."
               while :; do
                 # A NotFound is legitimate here and loops: the CSV appears only once the InstallPlan
                 # completes. Any OTHER error is fatal and says so.
@@ -147,7 +152,7 @@ spec:
                 sleep 10
               done
 
-              log "3/5 waiting for every operand the operator declares to be Available ..."
+              log "3/6 waiting for every operand the operator declares to be Available ..."
               # THE OPERATOR'S OWN VERDICT, not a count of Deployments. This used to be
               # `[ count -ge 3 ]` against `oc get deploy -n cert-manager`, a number that matched today's
               # three operands by luck: a version shipping four would satisfy it after three, and one
@@ -201,7 +206,7 @@ spec:
                 sleep 5
               done
 
-              log "4/5 waiting for cert-manager CRDs to be Established ..."
+              log "4/6 waiting for cert-manager CRDs to be Established ..."
               for crd in clusterissuers.cert-manager.io certificates.cert-manager.io; do
                 while :; do
                   oc get "$CRDS_API" "${crd}" >/dev/null 2>&1 && break
@@ -218,7 +223,7 @@ spec:
               # ClusterIssuer create fails with an x509/"webhook.cert-manager.io"
               # error. Probe with a server-dry-run (nothing persisted) until the
               # validating webhook actually accepts a cert-manager resource.
-              log "5/5 waiting for the cert-manager validating webhook to serve admission ..."
+              log "5/6 waiting for the cert-manager validating webhook to serve admission ..."
               PROBE='{"apiVersion":"cert-manager.io/v1","kind":"ClusterIssuer","metadata":{"name":"cmv-webhook-probe"},"spec":{"selfSigned":{}}}'
               while :; do
                 if out=$(printf '%s' "${PROBE}" | oc create --dry-run=server -f - 2>&1); then
@@ -230,6 +235,62 @@ spec:
                 The last rejection is logged above. Inspect: oc get ${DEPLOYS} -n ${OPERAND_NS}; oc logs -n ${OPERAND_NS} deploy/cert-manager-webhook --tail=100"
                 sleep 5
               done
+
+{{- if and .Values.verifyJob.checkCredentialsSecret .Values.clusterIssuer.enabled (not .Values.tppCredentials.create) }}
+              # THE PRE-CREATED CREDENTIAL. tppCredentials.create is false — the chart's default and the safer
+              # one, since a Secret Helm owns can be pruned by Helm — so the ClusterIssuer references a Secret
+              # this chart does not manage. Nothing checked it existed until now: the install succeeded, the
+              # issuer was created, and the failure surfaced later as
+              #   ready=False reason=ErrorSetup: error building client: ... secret "tpp-secret" not found
+              # which is indistinguishable from an unreachable TPP endpoint. Checking here means the install
+              # fails with the actual cause and the command to fix it, before the issuer is created at all.
+              #
+              # THE KEYS ARE CHECKED TOO, not just existence. A Secret with the wrong key names fails at
+              # runtime exactly like a missing one — `oc create secret generic` with the wrong --from-literal
+              # names is an easy mistake and produces an identical ErrorSetup.
+              log "6/6 checking the pre-created TPP credentials Secret ..."
+              # `-o jsonpath={.data}` and parse the keys from the JSON map. An earlier version used
+              # `{range $k, $v := .data}`, which oc's jsonpath implementation rejects outright —
+              # "unrecognized character in action: U+002C". It failed on a secret that was perfectly fine,
+              # and only the error branch stopped that being reported as "not found". Caught by testing the
+              # happy path, which is the branch a check like this is least likely to be run against.
+              if ! out=$(oc get secrets "$TPP_SECRET" -n "$OPERAND_NS" -o jsonpath='{.data}' 2>&1); then
+                if is_notfound "${out}"; then
+                  fail "Secret \"${TPP_SECRET}\" not found in namespace ${OPERAND_NS}.
+                tppCredentials.create is false, so this chart expects the credential to exist already.
+                Create it, or set tppCredentials.create=true and supply the base64 values:
+                  oc create secret generic ${TPP_SECRET} -n ${OPERAND_NS} \\
+                    --from-literal=username=<user> --from-literal=password=<pass>"
+                fi
+                # Not a NotFound, so this is a read failure rather than an absent Secret. Naming only one
+                # possible cause would be a guess: a Forbidden means the RBAC rule is missing, anything else
+                # is quoted verbatim so the reader sees what oc actually said.
+                case "${out}" in
+                  *Forbidden*)
+                    fail "cannot read Secret ${TPP_SECRET} in ${OPERAND_NS}: ${out}
+                The verify ClusterRole is missing its resourceNames-scoped get on secrets. Inspect:
+                  oc auth can-i get secrets/${TPP_SECRET} -n ${OPERAND_NS} --as=system:serviceaccount:${OPERATOR_NS}:${SA_NAME}" ;;
+                  *)
+                    fail "cannot read Secret ${TPP_SECRET} in ${OPERAND_NS}: ${out}" ;;
+                esac
+              fi
+              # ${out} is the JSON map, e.g. {"password":"...","username":"..."}. Match on the quoted KEY
+              # followed by a colon, so a value that happens to contain the word "username" cannot satisfy
+              # this — base64 makes that unlikely but not impossible, and a false pass here means the runtime
+              # ErrorSetup this stage exists to prevent.
+              MISSING=""
+              for k in username password; do
+                case "${out}" in *"\"${k}\":"*) ;; *) MISSING="${MISSING} ${k}" ;; esac
+              done
+              [ -n "$MISSING" ] && fail "Secret ${TPP_SECRET} exists but is missing key(s):${MISSING}
+                cert-manager's Venafi issuer reads the keys 'username' and 'password'; a Secret with other names
+                fails at runtime exactly like a missing one. It currently has: ${out:-<no keys>}
+                Recreate it:
+                  oc delete secret ${TPP_SECRET} -n ${OPERAND_NS}
+                  oc create secret generic ${TPP_SECRET} -n ${OPERAND_NS} \\
+                    --from-literal=username=<user> --from-literal=password=<pass>"
+              log "    ${TPP_SECRET} present with username and password"
+{{- end }}
 
               log "SUCCESS: operator installed, operands Available, CRDs Established, webhook serving — ClusterIssuer may be created"
 {{- end }}

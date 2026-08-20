@@ -107,10 +107,25 @@ spec:
               # later decides, and waiting for a verdict cannot change that. Costs one list.
               CANDIDATE=""
               for c in $(oc get "$CSVS" -n "$NAMESPACE" -o name 2>/dev/null || true); do
+                [ -n "$c" ] || continue
                 nm="${c##*/}"
+                [ -n "$nm" ] || continue
                 case "$nm" in *"${PACKAGE#openshift-}"*|"${PACKAGE}"*) ;; *) continue ;; esac
                 [ -n "$(oc get "$c" -n "$NAMESPACE" -o jsonpath='{.metadata.labels.olm\.copiedFrom}' 2>/dev/null || true)" ] && continue
                 [ -n "$(oc get "$c" -n "$NAMESPACE" -o jsonpath='{.metadata.ownerReferences}' 2>/dev/null || true)" ] && continue
+                # A CSV OLM IS ACTIVELY WORKING ON IS NOT AN ORPHAN. Measured: an upgrade left the CSV at
+                # phase=Installing with no ownerReferences yet and no Subscription referencing it — so it
+                # matched every orphan test, this Job waited its whole budget for a verdict that OLM had not
+                # published yet, and the hook failed with DeadlineExceeded. Deleting it would have been worse:
+                # it would have torn out an install in progress.
+                #
+                # Only a SETTLED CSV can be an orphan. Succeeded or Failed means OLM has finished with it;
+                # Installing, Pending, Replacing and InstallReady all mean it is mid-flight.
+                ph="$(oc get "$c" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+                case "$ph" in
+                  Succeeded|Failed) ;;
+                  *) log "  ${nm}: phase=${ph:-<none>}, OLM is still working on it — not an orphan"; continue ;;
+                esac
                 ref=""
                 for s in $(oc get "$SUBS" -n "$NAMESPACE" -o name 2>/dev/null || true); do
                   [ "$(oc get "$s" -n "$NAMESPACE" -o jsonpath='{.status.installedCSV}' 2>/dev/null || true)" = "$nm" ] && ref=yes
@@ -158,6 +173,7 @@ spec:
               # Condition 1 (ResolutionFailed) is already established above.
               RECLAIMED=""
               for c in $(oc get "$CSVS" -n "$NAMESPACE" -o name 2>/dev/null || true); do
+                [ -n "$c" ] || continue
                 name="${c##*/}"
                 # 3. the name must match this package
                 case "$name" in *"${PACKAGE#openshift-}"*|"${PACKAGE}"*) ;; *) continue ;; esac
@@ -169,6 +185,13 @@ spec:
                 # 4. no ownerReferences — an OLM-managed CSV has an owner, an orphan does not
                 owners="$(oc get "$c" -n "$NAMESPACE" -o jsonpath='{.metadata.ownerReferences}' 2>/dev/null || true)"
                 [ -n "$owners" ] && { log "  ${name}: has ownerReferences, OLM-managed, leaving alone"; continue; }
+                # Settled only — same rule as the candidate scan above, so the two cannot disagree about what
+                # counts as an orphan. Deleting a CSV mid-install tears out work in progress.
+                phase="$(oc get "$c" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+                case "$phase" in
+                  Succeeded|Failed) ;;
+                  *) log "  ${name}: phase=${phase:-<none>}, OLM still working on it, leaving alone"; continue ;;
+                esac
                 # 5. no Subscription reports it as installedCSV
                 referenced=""
                 for s in $(oc get "$SUBS" -n "$NAMESPACE" -o name 2>/dev/null || true); do
@@ -176,8 +199,27 @@ spec:
                 done
                 [ -n "$referenced" ] && { log "  ${name}: referenced by a Subscription, leaving alone"; continue; }
                 log "  ${name}: ORPHANED (no owner, unreferenced, not a copy) — deleting so OLM can resolve"
-                oc delete "$CSVS" "$name" -n "$NAMESPACE" --wait=true 2>&1 | sed 's/^/    /' \
-                  || fail "could not delete orphaned CSV ${name}; this ServiceAccount needs delete on clusterserviceversions"
+                # DELETE BY THE FULL `-o name` REFERENCE, and guard the name. The failure that made this
+                # necessary: an upgrade logged only
+                #   error: You must provide one or more resources by argument or filename
+                # which is `oc delete`'s message for a call with NO resource — reached when $name was empty.
+                # `$c` already carries `<type>/<name>` from the list, so using it directly removes the
+                # reassembly step where a name can go missing at all.
+                #
+                # AND NOT THROUGH A PIPE. The old form was `oc delete ... 2>&1 | sed | fail`, where `||`
+                # tests SED's exit status, not oc's — so a failed delete could be reported as a success. That
+                # is the same subshell/exit-status trap the sibling sweeper hit with `printf | while read`.
+                [ -n "$name" ] || fail "internal error: empty CSV name from '${c}' — refusing to run oc delete with no resource"
+                # --wait=false, deliberately. The point is to unblock resolution, and OLM re-resolves once the deletion
+                # is requested; a CSV carries an operators.coreos.com/csv-cleanup finalizer, so waiting adds a
+                # way for this Job to hit its deadline without adding anything.
+                if out="$(oc delete "$c" -n "$NAMESPACE" --wait=false 2>&1)"; then
+                  printf '%s\n' "$out" | sed 's/^/    /'
+                else
+                  printf '%s\n' "$out" | sed 's/^/    /'
+                  fail "could not delete orphaned CSV ${name}: ${out}
+                A Forbidden means this ServiceAccount lacks delete on clusterserviceversions in ${NAMESPACE}."
+                fi
                 RECLAIMED="${RECLAIMED} ${name}"
               done
 

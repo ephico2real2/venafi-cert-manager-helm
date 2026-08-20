@@ -5,7 +5,7 @@ description: >-
   bundle, provisions the TPP credential/CA secrets, and configures a Venafi TPP
   ClusterIssuer for issuing certificates from a shared PKI.
 type: application
-version: 0.2.0
+version: 0.3.0
 # appVersion tracks the cert-manager operator channel this chart targets.
 appVersion: "stable-v1"
 keywords:

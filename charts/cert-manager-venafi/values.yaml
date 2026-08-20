@@ -225,6 +225,19 @@ verifyJob:
   # entitled OpenShift/CRC cluster via the global pull secret.
   image: registry.redhat.io/openshift4/ose-cli:latest
   imagePullPolicy: IfNotPresent
+  # Check that the pre-created TPP credentials Secret exists, and carries the username/password keys, before
+  # the ClusterIssuer is created. Only applies when tppCredentials.create is false — if the chart creates the
+  # Secret it is in the manifest and cannot be missing.
+  #
+  # ON by default because the failure it catches is otherwise silent: the install succeeds, the issuer is
+  # created, and the problem surfaces later as `ready=False reason=ErrorSetup ... secret not found`, which
+  # looks identical to an unreachable TPP endpoint.
+  #
+  # TURN IT OFF when the Secret is not a plain Secret at install time — an ExternalSecret or SealedSecret that
+  # a controller reconciles moments later, a CSI-driver-projected credential, or any flow where the object
+  # legitimately appears after this Job runs. In those cases the check would fail an install that is fine.
+  # Turning it off also drops the resourceNames-scoped `get secrets` rule from the verify ClusterRole.
+  checkCredentialsSecret: true
   # Overall wait budget for the verification, in seconds.
   timeoutSeconds: 600
   backoffLimit: 1

@@ -54,6 +54,20 @@ rules:
   - apiGroups: ["cert-manager.io"]
     resources: ["clusterissuers"]
     verbs: ["create"]
+{{- if and .Values.verifyJob.checkCredentialsSecret .Values.clusterIssuer.enabled (not .Values.tppCredentials.create) }}
+  # `get` on exactly the Secrets the ClusterIssuer references, so the gate can confirm a pre-created
+  # credential exists BEFORE the issuer is created. resourceNames works here because both are read by name —
+  # and it is why this is not a blanket read on secrets. Only present when the chart is NOT creating them:
+  # if tppCredentials.create is true the Secret is in the manifest and cannot be missing.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+    resourceNames:
+      - {{ .Values.tppCredentials.secretName | quote }}
+  {{- if .Values.clusterIssuer.venafi.tpp.caBundleSecretRef.enabled }}
+      - {{ .Values.tppCABundle.secretName | quote }}
+  {{- end }}
+{{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
