@@ -1,5 +1,18 @@
 # venafi-certificate-sample
 
+## Install from the chart repository
+
+```bash
+helm repo add cert-manager-venafi https://ephico2real2.github.io/venafi-cert-manager-helm
+helm repo update
+helm install my-cert cert-manager-venafi/venafi-certificate-sample \
+  -n <your-namespace> --create-namespace
+```
+
+The issuer this chart requests from is installed cluster-wide by the `cert-manager-venafi` chart in the same
+repository — a tenant only manages the `Certificate` here, never the TPP credentials.
+
+
 A tenant-facing sample that **validates** the Venafi integration end-to-end: it
 creates a namespaced `Certificate` that requests a real cert from the shared
 `ClusterIssuer` installed by the [`cert-manager-venafi`](../cert-manager-venafi)

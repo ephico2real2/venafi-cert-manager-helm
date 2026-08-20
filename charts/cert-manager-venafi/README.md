@@ -18,6 +18,18 @@ operator to be fully installed (CSV `Succeeded`, operands `Available`, CRDs
 
 ---
 
+## Install from the chart repository
+
+```bash
+helm repo add cert-manager-venafi https://ephico2real2.github.io/venafi-cert-manager-helm
+helm repo update
+helm search repo cert-manager-venafi
+helm install cert-manager-venafi cert-manager-venafi/cert-manager-venafi -n default
+```
+
+Published by `.github/workflows/helm.yaml` on every change under `charts/`. Note chart-releaser publishes
+only charts that **changed** since the last tag, so a chart that never changes never appears in the index.
+
 ## Quick start
 
 ```bash
