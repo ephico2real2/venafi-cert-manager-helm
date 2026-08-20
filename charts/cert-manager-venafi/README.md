@@ -30,6 +30,9 @@ helm install cert-manager-venafi cert-manager-venafi/cert-manager-venafi -n defa
 Published by `.github/workflows/helm.yaml` on every change under `charts/`. Note chart-releaser publishes
 only charts that **changed** since the last tag, so a chart that never changes never appears in the index.
 
+To download and read the chart before installing it — or to move it into an air-gapped cluster — see
+[`docs/HELM_DOWNLOAD_AND_INSTALL.md`](../../docs/HELM_DOWNLOAD_AND_INSTALL.md).
+
 ## Quick start
 
 ```bash

@@ -50,3 +50,14 @@ oc -n daa-aro-rnd get certificate     # READY=True
   <https://docs.redhat.com/en/documentation/openshift_container_platform/4.20/html/security_and_compliance/cert-manager-operator-for-red-hat-openshift#cert-manager-install-cli_cert-manager-operator-install>
 - Upstream cert-manager — Venafi issuer:
   <https://cert-manager.io/v1.6-docs/configuration/venafi/>
+
+## Installing from the chart repository
+
+```sh
+helm repo add cert-manager-venafi https://ephico2real2.github.io/venafi-cert-manager-helm
+helm repo update
+helm search repo cert-manager-venafi --versions
+```
+
+To download the chart and read it before it touches a cluster, pin an exact version, or move it into an
+air-gapped environment, see [`docs/HELM_DOWNLOAD_AND_INSTALL.md`](docs/HELM_DOWNLOAD_AND_INSTALL.md).
