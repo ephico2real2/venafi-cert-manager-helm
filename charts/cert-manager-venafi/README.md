@@ -8,15 +8,19 @@ A single `helm install` is **self-gating**: a post-install hook Job waits for th
 operator to be fully installed (CSV `Succeeded`, operands `Available`, CRDs
 `Established`, and the **validating webhook serving admission**) before the
 `ClusterIssuer` is created. See the
-[top-level README](../README.md) for the full install + validation walkthrough.
+[top-level README](https://github.com/ephico2real2/venafi-cert-manager-helm/blob/main/charts/README.md) for the full install + validation walkthrough.
 
 - **Type:** application · **Scope:** cluster (operator + `ClusterIssuer`)
 - **Requires:** OpenShift 4.x + OLM, `cluster-admin`, Helm 3 (Red Hat path)
 - **Also runs on upstream cert-manager** — turn the operator/injection pieces off
   and let the CA-pull Job establish TPP trust from the endpoint. See
-  [Using with upstream cert-manager](../README.md#using-with-upstream-cert-manager).
+  [Using with upstream cert-manager](https://github.com/ephico2real2/venafi-cert-manager-helm/blob/main/charts/README.md#using-with-upstream-cert-manager).
 
 ---
+
+<!-- Links to anything outside this directory are ABSOLUTE on purpose. This README ships INSIDE the
+     packaged chart (helm pull --untar puts it at the chart root), where ../ and ../../ resolve to nothing —
+     a relative link that works on GitHub is dead for everyone who pulled the chart. -->
 
 ## Install from the chart repository
 
@@ -31,7 +35,7 @@ Published by `.github/workflows/helm.yaml` on every change under `charts/`. Note
 only charts that **changed** since the last tag, so a chart that never changes never appears in the index.
 
 To download and read the chart before installing it — or to move it into an air-gapped cluster — see
-[`docs/HELM_DOWNLOAD_AND_INSTALL.md`](../../docs/HELM_DOWNLOAD_AND_INSTALL.md).
+[`docs/HELM_DOWNLOAD_AND_INSTALL.md`](https://github.com/ephico2real2/venafi-cert-manager-helm/blob/main/docs/HELM_DOWNLOAD_AND_INSTALL.md).
 
 ## Quick start
 
@@ -250,8 +254,8 @@ install too — OLM stages an unapproved InstallPlan and waits.
 
 ## References
 
-- Design reasoning & the Red-Hat-vs-upstream narrative: [`steps.md`](../../steps.md)
-- Walkthrough (install + validate): [top-level charts README](../README.md)
+- Design reasoning & the Red-Hat-vs-upstream narrative: [`steps.md`](https://github.com/ephico2real2/venafi-cert-manager-helm/blob/main/steps.md)
+- Walkthrough (install + validate): [top-level charts README](https://github.com/ephico2real2/venafi-cert-manager-helm/blob/main/charts/README.md)
 - **Red Hat** — Installing the cert-manager Operator (CLI):
   <https://docs.redhat.com/en/documentation/openshift_container_platform/4.20/html/security_and_compliance/cert-manager-operator-for-red-hat-openshift#cert-manager-install-cli_cert-manager-operator-install>
 - **Red Hat** — Injecting a custom CA certificate (trusted-CA injection, § 9.4.1
