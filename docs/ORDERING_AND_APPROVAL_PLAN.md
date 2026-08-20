@@ -1,0 +1,178 @@
+# Ordering, races and the approval gate — plan
+
+Scope: `charts/cert-manager-venafi`. Written before changing anything, with each premise validated on a live
+cluster first. Two claims I started with turned out to be **wrong**; they are retracted below rather than
+quietly dropped, because the fix they implied would have been real work in the wrong direction.
+
+## 1. The logical flow, as it actually is
+
+```
+namespaces.yaml          Namespace x2                    ordinary
+operator.yaml            OperatorGroup + Subscription    ordinary
+tpp-credentials-secret   Secret                          ordinary
+tpp-cabundle-secret      Secret                          ordinary
+trusted-ca-configmap     ConfigMap                       ordinary
+                              |
+                              v            OLM: resolve -> InstallPlan -> CSV -> 3 operand Deployments
+                              |                           -> cert-manager CRDs -> webhook serving
+verify-rbac.yaml         SA + ClusterRole + CRB          HOOK weight 0
+capull-job.yaml          SA + Role + RoleBinding         HOOK weight 1
+capull-job.yaml          Job (pull TPP CA -> Secret)     HOOK weight 3
+verify-job.yaml          Job (5-stage readiness gate)    HOOK weight 5
+clusterissuer.yaml       ClusterIssuer                   HOOK weight 10   <- gated behind the gate
+```
+
+The verify Job's five stages are the right five, and stage 5 is a race the sibling charts never had to
+handle:
+
+1. `Subscription.status.installedCSV` appears
+2. that CSV reaches `phase=Succeeded`
+3. the operand Deployments become `Available`
+4. `clusterissuers` and `certificates` CRDs report `Established`
+5. the cert-manager **validating webhook actually serves admission**, probed with a
+   `oc create --dry-run=server` that persists nothing
+
+Stage 5 exists because a CRD being `Established` does not mean the webhook fronting it is answering yet —
+commit `35ba846` found that the hard way. Nothing in this plan changes those five stages.
+
+## 2. RETRACTED: "the ClusterIssuer hook cannot survive a first install"
+
+My first reading was that Helm builds every manifest — hooks included — before running any hook, so a
+`cert-manager.io/v1` ClusterIssuer at weight 10 could never work on a cluster without the CRDs, and the
+chart's own comment claiming otherwise was wrong. **That is incorrect, and the chart is right.**
+
+Validated with two sandbox charts on a live cluster:
+
+| sandbox | result |
+|---|---|
+| CR of an unserved kind as a `post-install` hook at weight 10, **no** gate creating the CRD | **fails** — `unable to build kubernetes object for deleting hook … no matches for kind "ProbeIssuer"`. But the weight-5 gate Job **ran to completion first** (`probe-gate Complete 1/1`). |
+| weight-5 hook **creates** the CRD and waits for `Established`; weight-10 hook is a CR of that kind | **succeeds** — `STATUS: deployed`, gate succeeded, CRD present, CR created |
+
+So Helm resolves a hook's kinds **when it processes that hook**, not at operation start. A CRD that appears
+during an earlier hook is picked up. The weight-10 gating works exactly as the chart's comment says.
+
+Consequence for this plan: **no `crds/` vendoring here.** That was the fix for the sibling NCO chart because
+its policy CRs are *ordinary resources*, and ordinary resources ARE all built up front — a different Helm
+error (`unable to build kubernetes objects from release manifest`) and a different problem. Vendoring
+cert-manager's CRDs into this chart would have been unnecessary work and a copy to go stale.
+
+## 3. What IS wrong
+
+### 3.1 `verifyJob.enabled=false` is a footgun, not an option
+
+Measured: with the flag off the ClusterIssuer renders with **no hook annotations at all** — an ordinary
+resource, built with the whole manifest up front. On a cluster without the cert-manager CRDs that fails the
+install outright, which is what `values.yaml` currently documents as "on a fresh cluster install it once the
+operator is Ready". That is the manual phasing to remove.
+
+Fix: keep the gate mandatory for the ClusterIssuer. If someone genuinely wants no verify Job, the honest
+options are to disable the ClusterIssuer too, or to accept a documented two-step — but the default must not
+be a flag that quietly turns a working install into a failing one.
+
+### 3.2 The approval shortcut — `installPlanApproval: Automatic`, no pin
+
+The Subscription rides the **rolling** `stable-v1` channel with `Automatic` approval and no `startingCSV`.
+Measured on the cluster: `channel=stable-v1 approval=Automatic startingCSV=<unset>
+installedCSV=cert-manager-operator.v1.19.1 state=AtLatestKnown`, and the channel's `currentCSV` is
+`v1.19.1` today. When v1.20 is published, OLM installs it with no review and no change in git.
+
+Fix, matching both sibling charts:
+
+```yaml
+operator:
+  installPlanApproval: Manual
+  startingCSV: cert-manager-operator.v1.19.1
+```
+
+plus an approver Job that approves **only** the pinned CSV. Everything the sibling charts learned applies:
+
+- **wave 0, the Subscription's own wave, and `argocd.argoproj.io/hook: Sync` — not `PostSync`.** A
+  Manual-approval Subscription reports `Progressing` on a first install, because ArgoCD's health check for
+  `operators.coreos.com/Subscription` forgives `InstallPlanPending/RequiresApproval` only when
+  `.status.installedCSV` is already set. In any later wave the approver waits on the wave that is waiting on
+  it; as a `PostSync` hook it waits for a sync that cannot complete.
+- **a pending upgrade is reported, never silently ignored.** Refusing to approve a non-pinned plan is the
+  point, but a refusal nobody logs looks identical to an approver that failed to notice.
+- **an empty read is not "Automatic".** `oc get … 2>/dev/null || true` collapses *field absent*,
+  *Subscription missing* and *read failed* into one empty string. Keep the exit status and branch on it.
+
+### 3.3 Zero sync-waves: 0 of 16 documents
+
+Measured. Under ArgoCD every document therefore lands in wave 0 — Subscription, secrets, namespaces and the
+ClusterIssuer applied together, and deletes unordered. Absent is not neutral; ArgoCD reads it as wave 0.
+
+Proposed ladder, and it is not arbitrary — each step is something the next step needs:
+
+| wave | what | why here |
+|---|---|---|
+| -2 | Namespaces | everything else lives in them |
+| -1 | OperatorGroup | must exist before the Subscription resolves |
+| 0 | Subscription, **approver** + its RBAC | the approver shares the Subscription's wave, per 3.2 |
+| 1 | Secrets, trusted-CA ConfigMap, verify RBAC, ca-pull RBAC | prerequisites of the Jobs above them |
+| 2 | ca-pull Job | writes the CA Secret the issuer may reference |
+| 3 | verify Job | the five-stage readiness gate |
+| 4 | ClusterIssuer | needs the CRDs and the webhook the gate waited for |
+
+Deletes run in reverse, which is the property that matters on uninstall: the ClusterIssuer goes before the
+Subscription, so the operator is still alive while its own resource is removed.
+
+### 3.4 The ClusterIssuer needs `SkipDryRunOnMissingResource=true` under ArgoCD
+
+Helm hook ordering does not apply under ArgoCD; Argo dry-runs resources instead, and a dry-run against a
+kind the cluster does not serve yet **fails the whole sync**, not just that document. These CRDs arrive
+mid-sync from OLM. Per the ArgoCD docs the dry run still runs once the CRD is present, so this costs no
+validation on any later sync.
+
+### 3.5 Hook resources that should be ordinary
+
+`verify-rbac.yaml` (SA + ClusterRole + ClusterRoleBinding) and the ca-pull RBAC are Helm **hooks**. Helm
+*creates* hook resources rather than applying them and never records them in the release, so they survive
+`helm uninstall`, are never reconciled on upgrade, and accumulate. The sibling NCO chart hit exactly this
+with a namespace-as-a-hook. They should be ordinary resources at wave 1.
+
+### 3.6 Swallowed reads in the verify Job
+
+```
+csv=$(oc get subscription "${SUBSCRIPTION}" … 2>/dev/null || true)
+phase=$(oc get csv "${csv}" … 2>/dev/null || true)
+count=$(oc get deploy -n "${OPERAND_NS}" -o name 2>/dev/null | wc -l)
+```
+
+A Forbidden, a NotFound and a genuinely-absent field are indistinguishable. The Job then spins its whole
+budget and reports `TIMEOUT: no installedCSV`, which points at OLM when the cause was RBAC. Fix: keep the
+exit status, branch, and name the likely cause with the command to check.
+
+### 3.7 Short resource names
+
+`oc get subscription`, `csv`, `deploy`, `crd` in the verify Job, and 7 `clusterissuer` uses across the
+scripts and docs. A resource plural is not reserved: measured in the sibling chart, `oc get subscription`
+bound to `subscriptions.messaging.knative.dev` and returned Forbidden. These Jobs set `KUBECACHEDIR` to a
+fresh `emptyDir`, so the discovery cache is **cold on every run** and the binding is not stable between two
+runs of the same Job. A misrouted *list* returns nothing rather than failing — which for
+`oc get deploy -n cert-manager` would read as "no operand deployments yet" forever.
+
+### 3.8 `[ count -ge 3 ]`
+
+A magic number that matches today's three deployments (`cert-manager`, `cert-manager-cainjector`,
+`cert-manager-webhook`, all 1/1). A version shipping four would satisfy it after three; one shipping two
+would hang until timeout. Derive the expectation from the CSV's own `.spec.install.spec.deployments` instead,
+so the chart asks the operator what it installs.
+
+## 4. Not in scope
+
+- The `venafi-certificate-sample` chart.
+- `scripts/*.sh` beyond qualifying resource names — they are operator-run helpers, not part of the release.
+- The ClusterIssuer currently reporting `False / ErrorSetup` on the cluster. That is a TPP connectivity or
+  credential matter, not an ordering one, and it should be diagnosed separately rather than folded in here.
+
+## 5. How each change gets validated
+
+| change | validation |
+|---|---|
+| approval gate | render with the pin; run the approver script against the live Subscription; synthetic unapproved InstallPlan to exercise the patch path; confirm a non-pinned plan is reported and refused |
+| wave ladder | a `check-ordering.py` equivalent asserting every document declares a wave, the approver shares the Subscription's wave and is not `PostSync`, the gate precedes the ClusterIssuer, and each Job's RBAC is no later than the Job — each rule negative-tested by breaking the chart |
+| qualified names | a `qualified-resources.py` equivalent over the render and the scripts, negative-tested |
+| verify Job hardening | run the extracted script against the live cluster; force a Forbidden by running as a stripped SA and confirm it fails loudly instead of timing out |
+| no regression | `helm lint`, render every values combination, and a real `helm upgrade` on the cluster with the release's ClusterIssuer and operand state compared before/after |
+
+There is no CI in this repo at all, so the two check scripts above are also the first CI it gets.
