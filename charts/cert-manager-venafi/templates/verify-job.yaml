@@ -174,9 +174,20 @@ spec:
                 fi
                 avail=$(printf '%s\n' "${out}" | grep -c 'deploymentAvailable=True' || true)
                 total=$(printf '%s\n' "${out}" | grep -c 'deploymentAvailable=' || true)
+                # DEGRADED IS CONTEXT, NOT A VERDICT. An earlier version of this stage failed fast on any
+                # Degraded=True, and a cold-start test proved that wrong twice over. Measured on a live
+                # cluster after reinstalling the operator: all three components reported
+                # deploymentAvailable=True AND deploymentDegraded=True at the same time, with every operand
+                # Deployment 1/1 and the webhook serving admission. The Degraded reason was
+                # `SyncError: (Retrying) trusted CA config map "trusted-ca" doesn't exist` — a condition that
+                # was STALE, still True minutes after the ConfigMap had been recreated, because the operator
+                # had not re-reconciled it yet.
+                #
+                # So Degraded is neither terminal nor necessarily current. Available is the gate; Degraded is
+                # logged so a run that DOES stall explains itself, and it is repeated in the timeout message
+                # where it is genuinely diagnostic.
                 degraded=$(printf '%s\n' "${out}" | grep 'Degraded=True' | head -3 | tr '\n' ' ')
-                [ -n "${degraded}" ] && fail "the cert-manager operator reports a Degraded component: ${degraded}
-                Inspect: oc get ${CMOP} cluster -o yaml"
+                [ -n "${degraded}" ] && log "    note: operator reports Degraded (not fatal, often stale): ${degraded}"
                 # EVERY SELECTOR MUST MATCH SOMETHING: total=0 means the condition naming changed, and
                 # treating that as "nothing to wait for" would let this stage pass without checking anything.
                 if [ "${total}" -gt 0 ] && [ "${avail}" -eq "${total}" ]; then
@@ -185,6 +196,7 @@ spec:
                 fi
                 log "    ${avail}/${total:-0} operand component(s) Available"
                 [ "$(date +%s)" -ge "${deadline}" ] && fail "operands not all Available within ${TIMEOUT}s (${avail}/${total:-0}).
+                ${degraded:+Degraded components (this is where that matters): ${degraded}}
                 Inspect: oc get ${CMOP} cluster -o yaml; oc get ${DEPLOYS} -n ${OPERAND_NS}"
                 sleep 5
               done

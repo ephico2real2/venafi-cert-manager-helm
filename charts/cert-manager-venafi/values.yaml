@@ -17,6 +17,13 @@ namespaces:
   # Namespace that hosts the cert-manager operands (controller, webhook, cainjector)
   # and the ClusterIssuer's referenced secrets.
   operand: cert-manager
+  # Leave the namespaces behind when the release is uninstalled. ON by default because this chart CREATES
+  # them and other things end up living in them — measured on this cluster, the operand namespace holds the
+  # root CA Secret of an unrelated LDAP TLS chain, the TPP credentials Secret and the webhook CA. Deleting
+  # the namespace to remove a Subscription would have broken LDAPS for a service with no connection to this
+  # release. Set false only if the namespaces are exclusively this chart's, and note that an uninstall then
+  # destroys their contents.
+  protectOnUninstall: true
 
 # -----------------------------------------------------------------------------
 # Trusted CA injection
@@ -64,6 +71,35 @@ operator:
   startingCSV: cert-manager-operator.v1.19.1
   # OperatorGroup upgrade strategy. "Default" preserves OLM's standard behavior.
   upgradeStrategy: Default
+
+# -----------------------------------------------------------------------------
+# Orphaned-CSV reclaim
+# `helm uninstall` removes the Subscription but OLM LEAVES THE CSV BEHIND with no ownerReferences, so
+# nothing garbage-collects it. The next install then cannot resolve — ResolutionFailed, "constraints not
+# satisfiable: @existing/..." — and no InstallPlan is ever staged, so the approver waits out its whole
+# budget for something that cannot arrive. Observed exactly that on this cluster.
+#
+# This Job clears the orphan BEFORE the approver runs (helm weight -6 vs -5), which is the ordering the
+# sibling namespace-configuration-operator chart arrived at after measuring the failure. Under ArgoCD it
+# matters more: there is no human in the sync loop to run `oc delete clusterserviceversions...`, so the
+# Subscription would fail every sync forever.
+#
+# It deletes only on SIX conditions and never touches an OLM copy — see the template.
+# -----------------------------------------------------------------------------
+csvReclaim:
+  enabled: true
+  image: registry.redhat.io/openshift4/ose-cli:latest
+  imagePullPolicy: IfNotPresent
+  # How long to wait for OLM to publish a verdict (installedCSV, or ResolutionFailed) before deciding.
+  # Sampling once would see neither straight after a sync and skip the reclaim entirely.
+  waitSeconds: 120
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
 
 # -----------------------------------------------------------------------------
 # InstallPlan approver

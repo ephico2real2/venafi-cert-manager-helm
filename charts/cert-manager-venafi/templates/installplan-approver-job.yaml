@@ -204,6 +204,32 @@ spec:
               echo "=== Waiting for an unapproved InstallPlan that installs ${APPROVE_CSV} ==="
               TARGET=""
               while :; do
+                # RE-READ installedCSV EVERY ITERATION, not once before the loop. OLM does not always stage
+                # an InstallPlan: when a CSV for the pinned version already exists in the namespace it can
+                # adopt it and set .status.installedCSV directly. An approver that read installedCSV once
+                # would then wait out its entire budget for a plan that is never coming and fail an install
+                # that had actually succeeded. Observed while testing a reinstall against a surviving CSV.
+                INSTALLED="$(oc get "$SUBS" "$SUBSCRIPTION" -n "$NAMESPACE" -o jsonpath='{.status.installedCSV}' 2>/dev/null || true)"
+                if [ "$INSTALLED" = "$APPROVE_CSV" ]; then
+                  log "OLM reports ${APPROVE_CSV} installed without staging an InstallPlan — nothing to approve"
+                  report_unapproved_others
+                  exit 0
+                fi
+                # A resolution failure will never produce an InstallPlan either, and waiting cannot fix it.
+                # The commonest cause is an orphaned CSV in the namespace that no Subscription owns: OLM
+                # reports `constraints not satisfiable: @existing/...` and stops. Measured on this cluster
+                # after deleting a Subscription but leaving its CSV behind.
+                RESOLVE="$(oc get "$SUBS" "$SUBSCRIPTION" -n "$NAMESPACE" -o jsonpath='{range .status.conditions[?(@.type=="ResolutionFailed")]}{.status}|{.message}{end}' 2>/dev/null || true)"
+                case "$RESOLVE" in
+                  True\|*)
+                    fail "OLM cannot resolve this Subscription, so no InstallPlan will ever appear:
+                  ${RESOLVE#True|}
+                An '@existing/...' constraint means a CSV for this operator is already in ${NAMESPACE} and is
+                owned by no Subscription — usually left behind when a previous Subscription was deleted. OLM
+                will not resolve past it. Remove it and re-run:
+                  oc delete ${CSVS} -n ${NAMESPACE} <the orphaned CSV>
+                Inspect: oc get ${CSVS} -n ${NAMESPACE}; oc get ${SUBS} ${SUBSCRIPTION} -n ${NAMESPACE} -o yaml" ;;
+                esac
                 for ip in $(oc get "$PLANS" -n "$NAMESPACE" -o name 2>/dev/null || true); do
                   owner="$(oc get "$ip" -n "$NAMESPACE" -o jsonpath='{.metadata.ownerReferences[?(@.kind=="Subscription")].name}' 2>/dev/null || true)"
                   case " $owner " in *" $SUBSCRIPTION "*) ;; *) continue ;; esac

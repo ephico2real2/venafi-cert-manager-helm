@@ -9,8 +9,18 @@ metadata:
   name: {{ .Values.trustedCA.configMapName }}
   namespace: {{ .Values.namespaces.operand }}
   annotations:
-    # Wave 1: after the Subscription and approver (0), before the Jobs that consume it (2 and 3).
-    argocd.argoproj.io/sync-wave: "1"
+    # WAVE -1, WITH THE OPERATORGROUP AND BEFORE THE SUBSCRIPTION — not wave 1, where an earlier version
+    # of this change put it. The Subscription sets TRUSTED_CA_CONFIGMAP_NAME to this ConfigMap, so the
+    # operator looks for it as soon as OLM starts it. In a later wave the operator starts first, does not
+    # find it, and reports on every component:
+    #   SyncError: (Retrying) trusted CA config map "trusted-ca" doesn't exist
+    # Measured on this cluster: that condition stayed True for minutes AFTER the ConfigMap was recreated,
+    # because the operator had not re-reconciled. Self-healing but noisy — and it makes the operator's own
+    # Degraded signal untrustworthy exactly when a readiness gate wants to read it.
+    #
+    # This ConfigMap has no dependencies of its own: OpenShift's network operator fills ca-bundle.crt from
+    # the label below. So there is no reason for it to wait for anything.
+    argocd.argoproj.io/sync-wave: "-1"
   labels:
     config.openshift.io/inject-trusted-cabundle: "true"
     {{- include "cert-manager-venafi.labels" . | nindent 4 }}
