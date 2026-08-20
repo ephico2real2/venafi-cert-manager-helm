@@ -1,0 +1,81 @@
+name: Release Charts
+
+# Publishes the charts to the gh-pages branch as a Helm repository — the same action and the same two
+# options as openshift-rbac-automation and group-sync-operator-helm-chart, so all three repos release
+# identically.
+on:
+  push:
+    branches:
+      - main
+    # Only when a chart itself changes. A docs edit does not warrant a release run.
+    #
+    # chart-releaser skips a version it has already published (skip_existing), so this is about not
+    # running at all rather than about correctness — it keeps the Actions history readable and means a
+    # green run genuinely corresponds to a chart change.
+    #
+    # Anything NOT matched here is still validated: ci.yaml has its own push-to-main trigger with no
+    # path filter.
+    paths:
+      - 'charts/**'
+
+  # So a release can be forced without an empty commit — e.g. after bumping only Chart.yaml's version,
+  # or to retry a run that failed on something transient.
+  workflow_dispatch:
+
+jobs:
+  # The same checks that run on every PR, called rather than duplicated. Without this, a direct push to
+  # main — or a merge landing while branch protection is off, which is this repo's current state — would
+  # publish an unvalidated chart.
+  validate:
+    uses: ./.github/workflows/ci.yaml
+
+  release:
+    needs: validate
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # chart-releaser needs full history to work out which versions already exist.
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      # charts_dir defaults to `charts`, and the action packages every SUBDIRECTORY of it. UNLIKE THE
+      # TWO SIBLING REPOS, THIS ONE HAS TWO CHARTS — cert-manager-venafi and venafi-certificate-sample —
+      # so both are published, each on its own version line. That is intended: the sample is how a tenant
+      # requests a certificate against the issuer this chart installs, and it is more useful in the repo
+      # index than as a copy-paste block in a README.
+      #
+      # THE gh-pages BRANCH MUST ALREADY EXIST. With packages_with_index, chart-releaser builds a git
+      # worktree from origin/gh-pages and does NOT create the branch — in the sibling repo the first run
+      # failed with
+      #   fatal: invalid reference: origin/gh-pages
+      # Bootstrap it once, empty, before the first run:
+      #   git worktree add --detach /tmp/gh && cd /tmp/gh
+      #   git checkout --orphan gh-pages && git rm -rf --cached . && rm -rf ./*
+      #   echo "# Helm chart repository" > README.md
+      #   git add README.md && git commit -m "chore: bootstrap gh-pages" && git push -u origin gh-pages
+      # GitHub then enables Pages on that branch automatically; nothing to click.
+      #
+      # AND IF A RUN EVER FAILS *AFTER* CREATING THE GITHUB RELEASE, the retry will not fix itself:
+      # skip_existing sees the release and skips the whole upload, including copying the .tgz onto
+      # gh-pages. index.yaml then lists a package that is not there and `helm install` 404s. Delete the
+      # release and its tag, then re-run:
+      #   gh release delete <chart>-<version> --yes --cleanup-tag
+      # Both of these were hit setting up the sibling repo; neither is obvious from the action's docs.
+      - name: Run chart-releaser
+        uses: helm/chart-releaser-action@v1.6.0
+        with:
+          skip_existing: true
+          packages_with_index: true
+        env:
+          CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"

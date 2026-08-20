@@ -185,13 +185,26 @@ jobs:
         with:
           fetch-depth: 0
       - name: A change under charts/ requires a new Chart.yaml version
+        # EVERY chart under charts/, not just the main one. helm.yaml publishes each subdirectory of
+        # charts/, so the sample chart is released too — and chart-releaser SKIPS a version it has
+        # already published (skip_existing), so shipping a change under an unchanged version publishes
+        # nothing and still reports green. Checking only $CHART would leave that silent.
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
         run: |
-          if git diff --quiet "$BASE" -- "$CHART"; then
-            echo "chart unchanged — no bump needed"; exit 0
-          fi
-          old=$(git show "$BASE:$CHART/Chart.yaml" 2>/dev/null | awk '/^version:/{print $2}')
-          new=$(awk '/^version:/{print $2}' "$CHART/Chart.yaml")
-          echo "chart changed: $old -> $new"
-          [ "$old" != "$new" ] || { echo "::error::$CHART changed but version is still $new"; exit 1; }
+          rc=0
+          for dir in charts/*/; do
+            [ -f "${dir}Chart.yaml" ] || continue
+            chart="${dir%/}"
+            if git diff --quiet "$BASE" -- "$chart"; then
+              echo "${chart}: unchanged — no bump needed"; continue
+            fi
+            old=$(git show "$BASE:$chart/Chart.yaml" 2>/dev/null | awk '/^version:/{print $2}')
+            new=$(awk '/^version:/{print $2}' "$chart/Chart.yaml")
+            echo "${chart}: changed, $old -> $new"
+            if [ "$old" = "$new" ]; then
+              echo "::error::$chart changed but version is still $new — chart-releaser would skip it silently"
+              rc=1
+            fi
+          done
+          exit $rc
