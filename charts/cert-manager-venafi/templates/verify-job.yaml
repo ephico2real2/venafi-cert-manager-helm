@@ -10,6 +10,14 @@ metadata:
   labels:
     {{- include "cert-manager-venafi.labels" . | nindent 4 }}
   annotations:
+    # Wave 3: after the ca-pull Job (2), before the ClusterIssuer (4) that depends on everything this Job
+    # waits for. Under plain Helm the weight does the ordering; under ArgoCD the wave does.
+    argocd.argoproj.io/sync-wave: "3"
+    # Same reason as the ca-pull Job: with no argocd hook annotation Argo treats this as an ordinary
+    # resource and the second sync fails on the immutable spec.template. HookSucceeded keeps a FAILED
+    # run's pod log, which for a five-stage readiness gate is the only place the reason lives.
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
     "helm.sh/hook": post-install,post-upgrade
     "helm.sh/hook-weight": "5"
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded

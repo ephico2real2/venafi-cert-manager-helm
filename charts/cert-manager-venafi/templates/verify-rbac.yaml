@@ -10,9 +10,11 @@ metadata:
   labels:
     {{- include "cert-manager-venafi.labels" . | nindent 4 }}
   annotations:
-    "helm.sh/hook": post-install,post-upgrade
-    "helm.sh/hook-weight": "0"
-    "helm.sh/hook-delete-policy": before-hook-creation
+    # Wave 1, and ORDINARY RESOURCES rather than hooks. Helm CREATES hook resources instead of applying
+    # them and never records them in the release, so hooked RBAC survives `helm uninstall`, is never
+    # reconciled on upgrade, and accumulates. Ordinary resources are also applied before any hook runs,
+    # which is precisely the ordering a hook Job needs from its own ServiceAccount.
+    argocd.argoproj.io/sync-wave: "1"
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -21,9 +23,11 @@ metadata:
   labels:
     {{- include "cert-manager-venafi.labels" . | nindent 4 }}
   annotations:
-    "helm.sh/hook": post-install,post-upgrade
-    "helm.sh/hook-weight": "0"
-    "helm.sh/hook-delete-policy": before-hook-creation
+    # Wave 1, and ORDINARY RESOURCES rather than hooks. Helm CREATES hook resources instead of applying
+    # them and never records them in the release, so hooked RBAC survives `helm uninstall`, is never
+    # reconciled on upgrade, and accumulates. Ordinary resources are also applied before any hook runs,
+    # which is precisely the ordering a hook Job needs from its own ServiceAccount.
+    argocd.argoproj.io/sync-wave: "1"
 rules:
   - apiGroups: ["operators.coreos.com"]
     resources: ["subscriptions", "clusterserviceversions"]
@@ -48,9 +52,11 @@ metadata:
   labels:
     {{- include "cert-manager-venafi.labels" . | nindent 4 }}
   annotations:
-    "helm.sh/hook": post-install,post-upgrade
-    "helm.sh/hook-weight": "0"
-    "helm.sh/hook-delete-policy": before-hook-creation
+    # Wave 1, and ORDINARY RESOURCES rather than hooks. Helm CREATES hook resources instead of applying
+    # them and never records them in the release, so hooked RBAC survives `helm uninstall`, is never
+    # reconciled on upgrade, and accumulates. Ordinary resources are also applied before any hook runs,
+    # which is precisely the ordering a hook Job needs from its own ServiceAccount.
+    argocd.argoproj.io/sync-wave: "1"
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole

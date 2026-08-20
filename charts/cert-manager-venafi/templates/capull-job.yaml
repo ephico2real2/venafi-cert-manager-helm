@@ -19,9 +19,9 @@ metadata:
   labels:
     {{- include "cert-manager-venafi.labels" . | nindent 4 }}
   annotations:
-    "helm.sh/hook": post-install,post-upgrade
-    "helm.sh/hook-weight": "1"
-    "helm.sh/hook-delete-policy": before-hook-creation
+    # Wave 1, ordinary resource — same reasoning as verify-rbac.yaml: a hooked ServiceAccount or binding
+    # is never recorded in the release and outlives an uninstall.
+    argocd.argoproj.io/sync-wave: "1"
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -31,9 +31,9 @@ metadata:
   labels:
     {{- include "cert-manager-venafi.labels" . | nindent 4 }}
   annotations:
-    "helm.sh/hook": post-install,post-upgrade
-    "helm.sh/hook-weight": "1"
-    "helm.sh/hook-delete-policy": before-hook-creation
+    # Wave 1, ordinary resource — same reasoning as verify-rbac.yaml: a hooked ServiceAccount or binding
+    # is never recorded in the release and outlives an uninstall.
+    argocd.argoproj.io/sync-wave: "1"
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
@@ -47,9 +47,9 @@ metadata:
   labels:
     {{- include "cert-manager-venafi.labels" . | nindent 4 }}
   annotations:
-    "helm.sh/hook": post-install,post-upgrade
-    "helm.sh/hook-weight": "1"
-    "helm.sh/hook-delete-policy": before-hook-creation
+    # Wave 1, ordinary resource — same reasoning as verify-rbac.yaml: a hooked ServiceAccount or binding
+    # is never recorded in the release and outlives an uninstall.
+    argocd.argoproj.io/sync-wave: "1"
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -71,6 +71,15 @@ metadata:
   labels:
     {{- include "cert-manager-venafi.labels" . | nindent 4 }}
   annotations:
+    # Wave 2: after its RBAC and the secrets (1), before the readiness gate (3). This Job talks to the TPP
+    # endpoint, not to the operator, so it does not need to wait for cert-manager.
+    argocd.argoproj.io/sync-wave: "2"
+    # WITHOUT AN ARGOCD HOOK ANNOTATION THIS IS AN ORDINARY RESOURCE TO ARGOCD, which does not read
+    # helm.sh/hook at all. Argo would re-apply the Job on every sync, and a Job's spec.template is
+    # IMMUTABLE — so the second sync fails with "field is immutable". BeforeHookCreation is what makes
+    # that moot, by deleting the previous run before creating this one.
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
     "helm.sh/hook": post-install,post-upgrade
     "helm.sh/hook-weight": "3"
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded

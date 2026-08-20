@@ -8,6 +8,9 @@ kind: ConfigMap
 metadata:
   name: {{ .Values.trustedCA.configMapName }}
   namespace: {{ .Values.namespaces.operand }}
+  annotations:
+    # Wave 1: after the Subscription and approver (0), before the Jobs that consume it (2 and 3).
+    argocd.argoproj.io/sync-wave: "1"
   labels:
     config.openshift.io/inject-trusted-cabundle: "true"
     {{- include "cert-manager-venafi.labels" . | nindent 4 }}
