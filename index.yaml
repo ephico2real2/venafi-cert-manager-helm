@@ -22,4 +22,24 @@ entries:
     urls:
     - cert-manager-venafi-0.3.1.tgz
     version: 0.3.1
-generated: "2026-08-20T22:31:36.862873246Z"
+  venafi-certificate-sample:
+  - apiVersion: v2
+    appVersion: 1.0.0
+    created: "2026-08-20T22:34:49.270330725Z"
+    description: 'Tenant-facing sample: requests a TLS certificate from the shared
+      Venafi TPP ClusterIssuer by creating a cert-manager Certificate resource. This
+      is the only object a tenant manages; cert-manager handles issuance and renewal.'
+    digest: 099f37940754691dbecb5f2a069e9bae13edc43c19da2ba7ecf7bd8dc46912bb
+    keywords:
+    - cert-manager
+    - certificate
+    - venafi
+    - tenant
+    maintainers:
+    - name: Platform Engineering
+    name: venafi-certificate-sample
+    type: application
+    urls:
+    - venafi-certificate-sample-0.1.0.tgz
+    version: 0.1.0
+generated: "2026-08-20T22:34:49.270337295Z"
