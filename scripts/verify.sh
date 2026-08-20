@@ -39,7 +39,7 @@ echo "=== install result ==="
 
 echo "=== state ==="
 helm list -A 2>/dev/null | grep "${RELEASE}" | awk '{print "  release:",$1,$8}'
-oc get csv -n "${OPERATOR_NS}" 2>/dev/null | grep "cert-manager " | awk '{print "  operator:",$NF}'
+oc get clusterserviceversions.operators.coreos.com -n "${OPERATOR_NS}" 2>/dev/null | grep "cert-manager " | awk '{print "  operator:",$NF}'
 oc get pods -n "${OPERAND_NS}" --no-headers 2>/dev/null | awk '{print "  pod:",$1,$3}'
-oc get clusterissuer "${ISSUER}" --no-headers 2>/dev/null | awk '{print "  issuer:",$1,"READY="$2}'
-oc get clusterissuer "${ISSUER}" -o jsonpath='  reason: {.status.conditions[0].reason}{"\n"}' 2>/dev/null
+oc get clusterissuers.cert-manager.io "${ISSUER}" --no-headers 2>/dev/null | awk '{print "  issuer:",$1,"READY="$2}'
+oc get clusterissuers.cert-manager.io "${ISSUER}" -o jsonpath='  reason: {.status.conditions[0].reason}{"\n"}' 2>/dev/null

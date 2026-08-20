@@ -24,12 +24,12 @@ confirm_destructive "Delete cert-manager (release '${RELEASE}', CSV, verify RBAC
 
 echo "=== teardown ==="
 helm uninstall "${RELEASE}" 2>&1 | tail -1
-oc delete clusterissuer --all 2>/dev/null
-oc delete csv -n "${OPERATOR_NS}" --all 2>/dev/null
+oc delete clusterissuers.cert-manager.io --all 2>/dev/null
+oc delete clusterserviceversions.operators.coreos.com -n "${OPERATOR_NS}" --all 2>/dev/null
 oc delete clusterrole "${RELEASE}-verify" 2>/dev/null
 oc delete clusterrolebinding "${RELEASE}-verify" 2>/dev/null
 oc delete ns "${OPERAND_NS}" "${OPERATOR_NS}" --wait=true --timeout=120s 2>&1 | tail -2
-oc get crd -o name 2>/dev/null | grep 'cert-manager.io' | xargs -r oc delete --timeout=60s >/dev/null 2>&1
+oc get customresourcedefinitions.apiextensions.k8s.io -o name 2>/dev/null | grep 'cert-manager.io' | xargs -r oc delete --timeout=60s >/dev/null 2>&1
 
 # wait for the namespaces to finish terminating
 for _ in $(seq 1 30); do
@@ -37,4 +37,4 @@ for _ in $(seq 1 30); do
   sleep 5
 done
 
-echo "clean → namespaces: $(oc get ns "${OPERAND_NS}" "${OPERATOR_NS}" --no-headers 2>/dev/null | wc -l | tr -d ' '), CRDs: $(oc get crd 2>/dev/null | grep -c cert-manager.io)"
+echo "clean → namespaces: $(oc get ns "${OPERAND_NS}" "${OPERATOR_NS}" --no-headers 2>/dev/null | wc -l | tr -d ' '), CRDs: $(oc get customresourcedefinitions.apiextensions.k8s.io 2>/dev/null | grep -c cert-manager.io)"

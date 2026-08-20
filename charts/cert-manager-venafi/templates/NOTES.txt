@@ -12,15 +12,15 @@ Component summary:
 Next steps:
 
 1. Confirm the operator installed:
-     oc get csv -n {{ .Values.namespaces.operator }}
+     oc get clusterserviceversions.operators.coreos.com -n {{ .Values.namespaces.operator }}
      oc get pods -n {{ .Values.namespaces.operand }}
 
 {{- if .Values.operator.enabled }}
 {{- if eq .Values.operator.installPlanApproval "Manual" }}
 
    installPlanApproval is Manual — approve the pending InstallPlan:
-     oc get installplan -n {{ .Values.namespaces.operator }}
-     oc patch installplan <name> -n {{ .Values.namespaces.operator }} --type merge -p '{"spec":{"approved":true}}'
+     oc get installplans.operators.coreos.com -n {{ .Values.namespaces.operator }}
+     oc patch installplans.operators.coreos.com <name> -n {{ .Values.namespaces.operator }} --type merge -p '{"spec":{"approved":true}}'
 {{- end }}
 {{- end }}
 
@@ -40,5 +40,5 @@ Next steps:
 {{- end }}
 
 3. Verify the ClusterIssuer is Ready:
-     oc get clusterissuer {{ .Values.clusterIssuer.name }} -o wide
+     oc get clusterissuers.cert-manager.io {{ .Values.clusterIssuer.name }} -o wide
      # Expect: Ready=True, Reason="Venafi issuer started"
