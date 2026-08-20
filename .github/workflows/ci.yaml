@@ -53,6 +53,68 @@ jobs:
           fi
           echo "approver requires a pinned CSV"
 
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install pyyaml
+      - name: README documented defaults match values.yaml
+        # Copied in spirit from the sibling group-sync chart, whose own comment records why it exists: a
+        # README row reading `installPlanApproval | Automatic` survived while values.yaml shipped Manual — a
+        # documented default that INVERTED a real control. This repo had no such check, and drifted exactly
+        # the same way: the default was flipped to Manual and the README kept saying Automatic, while two
+        # whole stanzas (csvReclaim, installPlanApprover) went undocumented.
+        run: |
+          python3 - <<'EOF'
+          import re, sys, yaml, pathlib
+          chart = pathlib.Path("charts/cert-manager-venafi")
+          values = yaml.safe_load((chart / "values.yaml").read_text())
+          readme = (chart / "README.md").read_text()
+
+          def dig(path):
+              cur = values
+              for k in path.split("."):
+                  if not isinstance(cur, dict) or k not in cur:
+                      return "<<absent>>"
+                  cur = cur[k]
+              return cur
+
+          bad, checked = [], 0
+          # | `key` | type | default | description |  — column 3 is the default. Reading column 2 by
+          # mistake compares "bool" against True and reports every row as broken; that was a real
+          # false-positive run while writing this.
+          for line in readme.splitlines():
+              m = re.match(r"^\|\s*`([a-zA-Z][\w.]*\.[\w.]+)`\s*\|[^|]*\|\s*([^|]*?)\s*\|", line)
+              if not m:
+                  continue
+              key, doc = m.group(1), m.group(2).strip().strip("`")
+              actual = dig(key)
+              if actual == "<<absent>>":
+                  bad.append(f"{key}: documented but absent from values.yaml"); continue
+              # Prose defaults for object-valued keys ("128Mi-512Mi mem") cannot be compared to a dict.
+              if isinstance(actual, dict) or doc in ("", "-", "(none)", "''", '""'):
+                  continue
+              checked += 1
+              a = str(actual).lower() if isinstance(actual, bool) else str(actual)
+              if a.lower() != doc.lower().strip("'\""):
+                  bad.append(f"{key}: README says {doc!r}, values.yaml has {actual!r}")
+
+          # Every top-level stanza must appear somewhere in the README.
+          for k in values:
+              if k not in readme:
+                  bad.append(f"{k}: top-level values stanza is undocumented")
+
+          # EVERY SELECTOR MUST MATCH SOMETHING: zero rows compared would pass forever.
+          if checked == 0:
+              bad.append("no comparable parameter rows found — the table format changed and this check "
+                         "stopped covering anything")
+
+          for b in bad:
+              print(f"::error::{b}")
+          print(f"compared {checked} documented default(s), {len(bad)} problem(s)")
+          sys.exit(1 if bad else 0)
+          EOF
+
   ordering:
     runs-on: ubuntu-latest
     steps:

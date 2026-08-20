@@ -418,3 +418,70 @@ rule were all already solved and documented in `openshift-rbac-automation` and
 plan and two failed installs.
 
 Check those charts before designing anything here.
+
+## 10. Found in final review, after 0.2.0
+
+### 10.1 NOTES.txt gave wrong advice on every install — caused by this change
+
+Flipping `installPlanApproval` to `Manual` made a pre-existing conditional in `NOTES.txt` fire on every
+install, and what it says is now false:
+
+```
+installPlanApproval is Manual — approve the pending InstallPlan:
+  oc patch installplans.operators.coreos.com <name> ... '{"spec":{"approved":true}}'
+```
+
+That instructs the operator to do by hand the exact thing the approver had already done automatically —
+verified against the deployed release, not just the template. The Manual branch now distinguishes
+approver-on (nothing to do; a non-pinned upgrade is deliberately left waiting; bump `startingCSV` to adopt
+one) from approver-off (you must approve by hand), and says nothing under `Automatic`. All three branches
+rendered and checked.
+
+This is the class of defect a final review exists for: every individual change was correct, and their
+combination produced user-facing instructions that were wrong.
+
+### 10.2 The README documented a default that inverted a real control
+
+`| operator.installPlanApproval | string | Automatic |` while `values.yaml` shipped `Manual`. The sibling
+group-sync chart's own CI comment records having hit precisely this — *"a documented default that inverted a
+real control"* — and this repo had no such check, so it drifted the same way. Two entire stanzas
+(`csvReclaim`, `installPlanApprover`) were undocumented, `namespaces.protectOnUninstall`,
+`operator.startingCSV` and `verifyJob.checkCredentialsSecret` were missing, the hook-order line still claimed
+RBAC ran as hooks at weights 0 and 1, and `verifyJob.resources` was stale from before this branch
+(`64Mi–128Mi` documented, `128Mi–512Mi` shipped).
+
+A `docs` CI job now compares every documented default against `values.yaml` and requires every top-level
+stanza to appear in the README. Negative-tested by restoring the wrong default: it reports
+`README says 'Automatic', values.yaml has 'Manual'` and compares 48 defaults. It skips object-valued rows,
+because prose like "128Mi–512Mi mem" cannot be compared to a dict, and it fails when zero rows are compared
+so a table-format change cannot silently disable it.
+
+Writing that check produced a false-positive run worth recording: reading column 2 instead of column 3
+compares `bool` against `True` and reports all 40 rows as broken. The real finding was visible in the raw
+table the whole time.
+
+### 10.3 Two things that looked like defects and were not
+
+- **`installPlanApprover.enabled=false` with `Manual` hangs the install** and is *not* guarded, unlike
+  `verifyJob.enabled=false` which is. Deliberate: disabling the approver is legitimate when something else
+  approves InstallPlans, and stage 1's timeout already names this exact cause. The asymmetry is justified by
+  the failure mode — `verifyJob=false` produces an obscure build-time `no matches for kind`, this produces a
+  self-explaining runtime timeout.
+- **`operator.enabled=false` still renders the verify gate and the ClusterIssuer.** Coherent: it means "I
+  manage the operator myself", and the gate verifying a Subscription this chart did not create is still
+  correct. If the name does not match, stage 1 fails loudly naming `operator.packageName`.
+
+### 10.4 The platform failure that was not the chart
+
+Two deploy attempts died on `FailedCreatePodSandBox`. Root cause: `node.kubernetes.io/disk-pressure` — the
+CRC VM at 84% disk (16% free), across the kubelet's `imagefs.available<15%` line, tainting the node so no new
+pod could schedule. Inodes were fine at 99.2% free. A `crc stop && crc start` freed 4.4 GB and the kubelet
+cleared the condition after its eviction transition period; the taint lifted and pending pods went to zero.
+
+Recorded because the diagnosis cost three wrong hypotheses first — `--wait=true` blocking (the hand-run
+delete measured 2s), an empty `$name` (neither empty-variable case produces the logged message), and a stale
+render. It also produced a measurement error of mine: a count labelled "in the last 5 min" was actually all
+421 retained events regardless of age; checking timestamps showed 0 in the last two minutes.
+
+The lasting lesson is about allocation, not the chart: the binding constraint on this cluster is the **60 GB
+disk**, not RAM. 49 GB of it is real content, so the reprieve is temporary.

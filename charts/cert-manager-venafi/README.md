@@ -45,12 +45,45 @@ oc get clusterissuer robocorp-tpp-venafi-issuer-rnd -o wide   # READY=True
 | Operator install | `OperatorGroup` + `Subscription` | `operator.enabled=true` |
 | TPP credentials | `Secret` (`data`, base64) | `tppCredentials.create=true` |
 | TPP CA bundle | `Secret` (`stringData`, PEM) | `tppCABundle.create=true` |
-| CA-pull hook | `Job` + `Role`/`RoleBinding`/`SA` | `caBundleSecretRef.enabled` + `caPullJob.enabled` |
-| Verify hook | `Job` + `ClusterRole`/`Binding`/`SA` | `verifyJob.enabled=true` |
+| CA-pull hook | `Job` (+ ordinary `Role`/`RoleBinding`/`SA`) | `caBundleSecretRef.enabled` + `caPullJob.enabled` |
+| Orphaned-CSV reclaim | `Job` (+ ordinary `Role`/`RoleBinding`/`SA`) | `operator.enabled` + `csvReclaim.enabled` |
+| InstallPlan approver | `Job` (+ ordinary `Role`/`RoleBinding`/`SA`) | `operator.enabled` + `installPlanApprover.enabled` |
+| Verify hook | `Job` (+ ordinary `ClusterRole`/`Binding`/`SA`) | `verifyJob.enabled=true` |
 | Venafi issuer | `ClusterIssuer` | `clusterIssuer.enabled=true` |
 
-Post-install hook order (by weight): verify RBAC `0` → CA-pull RBAC `1` →
-**CA-pull Job `3`** → **Verify Job `5`** → **ClusterIssuer `10`**.
+### Ordering
+
+Every Job's RBAC is an **ordinary resource**, not a hook — Helm never records hook resources in the release,
+so hooked RBAC survives `helm uninstall` and is never reconciled on upgrade. Ordinary resources are also
+applied before any hook runs, which is exactly what a hook Job needs from its own ServiceAccount.
+
+Post-install hook order (by `helm.sh/hook-weight`):
+
+**CSV reclaim `-6`** → **InstallPlan approver `-5`** → **CA-pull Job `-4`** → **Verify Job `5`** →
+**ClusterIssuer `10`**
+
+The reclaim runs first because an orphaned CSV makes the Subscription unresolvable, and OLM then stages no
+InstallPlan at all — so an approver ahead of it would wait out its whole budget for something that cannot
+arrive.
+
+Under ArgoCD the weights are inert and `argocd.argoproj.io/sync-wave` does the ordering instead:
+
+| wave | what |
+|---|---|
+| `-2` | Namespaces, CA-pull RBAC |
+| `-1` | trusted-CA ConfigMap, CA-pull Job, `OperatorGroup`, reclaim RBAC |
+| `0` | `Subscription`, reclaim Job, approver Job + their RBAC |
+| `1` | verify RBAC, TPP secrets |
+| `3` | verify Job |
+| `4` | `ClusterIssuer` |
+
+The approver shares the Subscription's wave deliberately: with `installPlanApproval: Manual` a Subscription
+reports `Progressing` until its InstallPlan is approved, and ArgoCD's health check forgives that only when
+`.status.installedCSV` is already set — an upgrade. On a first install an approver in any later wave waits on
+the wave that is waiting on it.
+
+Every Job also carries `argocd.argoproj.io/hook: Sync`. Without it ArgoCD treats a Helm-hook Job as an
+ordinary resource, re-applies it every sync, and the **second** sync fails on the immutable `spec.template`.
 
 ---
 
@@ -63,6 +96,8 @@ Post-install hook order (by weight): verify RBAC `0` → CA-pull RBAC `1` →
 | `namespaces.create` | bool | `true` | Create the operator + operand namespaces. Set `false` if pre-created (e.g. GitOps). |
 | `namespaces.operator` | string | `cert-manager-operator` | Namespace hosting the OLM operator. |
 | `namespaces.operand` | string | `cert-manager` | Namespace hosting the operands + referenced secrets. |
+
+| `namespaces.protectOnUninstall` | bool | `true` | Stamp `helm.sh/resource-policy: keep` on both Namespaces, so `helm uninstall` leaves them behind. ON by default because this chart CREATES them and other things end up living in them — deleting a namespace takes everything inside it. Measured on a lab cluster: the operand namespace held the root CA Secret of an unrelated LDAP TLS chain. Helm reads this from the STORED release manifest, so annotating a namespace by hand after the fact does nothing. |
 
 ### Trusted CA injection
 
@@ -80,7 +115,8 @@ Post-install hook order (by weight): verify RBAC `0` → CA-pull RBAC `1` →
 | `operator.packageName` | string | `openshift-cert-manager-operator` | OLM package name. |
 | `operator.source` | string | `redhat-operators` | CatalogSource name. |
 | `operator.sourceNamespace` | string | `openshift-marketplace` | CatalogSource namespace. |
-| `operator.installPlanApproval` | string | `Automatic` | `Automatic` (hands-off) or `Manual` (admin approves each InstallPlan). |
+| `operator.installPlanApproval` | string | `Manual` | `Manual` pairs with `startingCSV` and the approver below: the pinned version installs unattended, anything else waits for a person. `Automatic` lets OLM install every InstallPlan the channel produces — on a rolling channel like `stable-v1` that means an unreviewed operator upgrade. |
+| `operator.startingCSV` | string | `cert-manager-operator.v1.19.1` | The pinned version, and the approver's authority — it approves an InstallPlan only if it installs exactly this CSV. Note the CSV name does not begin with `packageName`. To move version, bump this and upgrade. |
 | `operator.upgradeStrategy` | string | `Default` | OperatorGroup upgrade strategy. |
 
 ### TPP credentials secret (authentication)
@@ -121,6 +157,44 @@ CA-bundle secret before the issuer is created.
 | `caPullJob.rbac.create` | bool | `true` | Create the secret-writer `Role`/`RoleBinding`/`SA`. |
 | `caPullJob.resources` | object | `128Mi–512Mi` mem | Pod resources (512Mi limit avoids the `oc apply` OOMKill). |
 
+### Orphaned-CSV reclaim
+
+`helm uninstall` removes the Subscription but OLM leaves the CSV behind with no `ownerReferences`, so nothing
+garbage-collects it. The next install cannot resolve — `ResolutionFailed: constraints not satisfiable:
+@existing/...` — and **no InstallPlan is ever staged**, so the approver would wait out its whole budget for
+something that cannot arrive. Under GitOps there is no human in the sync loop to run `oc delete
+clusterserviceversions...`, so the Subscription would fail every sync forever.
+
+Deletes only on all of: the Subscription reports `ResolutionFailed`; the CSV is in the operator namespace;
+its name matches the package; it has no `ownerReferences`; no Subscription references it as `installedCSV`;
+it is **not** an OLM copy (`olm.copiedFrom` empty — AllNamespaces mode copies the CSV into every namespace and
+every copy looks unowned); and its phase is **settled** (`Succeeded` or `Failed`) — a CSV mid-install matches
+every other test, and deleting it would tear out work in progress.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `csvReclaim.enabled` | bool | `true` | Run the reclaim hook (weight `-6`, before the approver). |
+| `csvReclaim.image` | string | `registry.redhat.io/openshift4/ose-cli:latest` | Image providing `oc`. |
+| `csvReclaim.imagePullPolicy` | string | `IfNotPresent` | |
+| `csvReclaim.waitSeconds` | int | `120` | How long to wait for OLM to publish a verdict (`installedCSV` or `ResolutionFailed`) before deciding. Only entered when a candidate orphan actually exists — on a clean cluster the Job exits in seconds. |
+| `csvReclaim.resources` | object | `64Mi–128Mi` mem | Pod resources. |
+
+### InstallPlan approver
+
+Approves **only** the InstallPlan that installs `operator.startingCSV`, so a `Manual`-approval Subscription
+still installs unattended while a channel upgrade waits for a human. Without it, `Manual` blocks the first
+install too — OLM stages an unapproved InstallPlan and waits.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `installPlanApprover.enabled` | bool | `true` | Run the approver hook (weight `-5`). Disable only if something else approves InstallPlans; with `installPlanApproval: Manual` and no approver, the first install hangs and the verify gate times out on stage 1 (which says so). |
+| `installPlanApprover.image` | string | `registry.redhat.io/openshift4/ose-cli:latest` | Image providing `oc`. |
+| `installPlanApprover.imagePullPolicy` | string | `IfNotPresent` | |
+| `installPlanApprover.waitSeconds` | int | `600` | One budget for both waits — for OLM to stage a plan, and for the CSV to reach `Succeeded` afterwards. |
+| `installPlanApprover.backoffLimit` | int | `0` | Every attempt polls the same state, so a retry re-waits from zero with no new information. |
+| `installPlanApprover.ttlSecondsAfterFinished` | int | `3600` | |
+| `installPlanApprover.resources` | object | `64Mi–128Mi` mem | Pod resources. |
+
 ### Verify Job
 
 | Parameter | Type | Default | Description |
@@ -131,7 +205,8 @@ CA-bundle secret before the issuer is created.
 | `verifyJob.timeoutSeconds` | int | `600` | Wait budget; on exceed the release fails and no issuer is created. |
 | `verifyJob.backoffLimit` | int | `1` | Job retry budget. |
 | `verifyJob.rbac.create` | bool | `true` | Create the read-only `ClusterRole`/`Binding`/`SA`. |
-| `verifyJob.resources` | object | `64Mi–128Mi` mem | Pod resources. |
+| `verifyJob.resources` | object | `128Mi–512Mi` mem | Pod resources (the stage-5 webhook probe runs `oc create --dry-run=server`; 512Mi avoids an OOMKill). |
+| `verifyJob.checkCredentialsSecret` | bool | `true` | Stage 6: confirm the pre-created TPP credentials Secret exists and carries `username`/`password` before the ClusterIssuer is created. Only applies when `tppCredentials.create=false`. Turn OFF when the Secret arrives later than this Job — an ExternalSecret or SealedSecret a controller reconciles, or a CSI-projected credential; the check would fail an install that is fine. Turning it off also drops the `resourceNames`-scoped `get secrets` rule from the verify ClusterRole. |
 
 ### ClusterIssuer
 

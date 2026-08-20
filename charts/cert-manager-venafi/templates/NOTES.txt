@@ -17,10 +17,23 @@ Next steps:
 
 {{- if .Values.operator.enabled }}
 {{- if eq .Values.operator.installPlanApproval "Manual" }}
+{{- if .Values.installPlanApprover.enabled }}
 
-   installPlanApproval is Manual — approve the pending InstallPlan:
+   installPlanApproval is Manual, and the installplan-approver Job already approved the pinned
+   version ({{ .Values.operator.startingCSV }}) for you — nothing to do by hand.
+
+   A channel upgrade to any OTHER version is deliberately left unapproved. To adopt one, bump
+   operator.startingCSV and upgrade — do not approve it on the cluster, or the next sync reverts
+   to the pin. What is waiting, if anything:
+     oc get installplans.operators.coreos.com -n {{ .Values.namespaces.operator }}
+     oc logs -n {{ .Values.namespaces.operator }} job/{{ .Release.Name }}-installplan-approver
+{{- else }}
+
+   installPlanApproval is Manual and installPlanApprover.enabled is FALSE, so nothing approves
+   InstallPlans — the operator will not install until you approve one by hand:
      oc get installplans.operators.coreos.com -n {{ .Values.namespaces.operator }}
      oc patch installplans.operators.coreos.com <name> -n {{ .Values.namespaces.operator }} --type merge -p '{"spec":{"approved":true}}'
+{{- end }}
 {{- end }}
 {{- end }}
 
