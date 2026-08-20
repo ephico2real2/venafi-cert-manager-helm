@@ -151,7 +151,35 @@ fresh `emptyDir`, so the discovery cache is **cold on every run** and the bindin
 runs of the same Job. A misrouted *list* returns nothing rather than failing — which for
 `oc get deploy -n cert-manager` would read as "no operand deployments yet" forever.
 
-### 3.8 `[ count -ge 3 ]`
+### 3.8 EVERY Job needs an ArgoCD hook annotation, not just the approver
+
+Caught in review of this plan: an earlier draft specified `argocd.argoproj.io/hook: Sync` only for the
+approver. The verify Job and the ca-pull Job need it too, and for a different reason than ordering.
+
+A `helm.sh/hook` Job with **no** `argocd.argoproj.io/hook` is not a hook to ArgoCD at all — it is an ordinary
+resource. Argo then applies it on every sync, and a Job's `spec.template` is **immutable**, so the second
+sync fails with `field is immutable`. The Helm annotations do nothing here; Argo does not read them.
+
+So all three Jobs get:
+
+```yaml
+argocd.argoproj.io/hook: Sync                                    # runs inside the sync, at its wave
+argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+```
+
+`BeforeHookCreation` is what makes the immutability moot — the previous run is deleted before the next is
+created. `HookSucceeded` keeps a failed run's pod log for reading, which for the verify Job is the whole
+point of having it.
+
+And deliberately NOT `Replace=true` or `SkipDryRunOnMissingResource=true` on the Jobs: both are valid
+options that do nothing for a `batch/v1` Job. The kind is built in, so there is no missing resource to skip
+a dry run for; and `BeforeHookCreation` already removes the previous object, so `kubectl replace` never
+applies. The sibling group-sync chart carries that pair on its Jobs and it is cargo — it is not copied here.
+
+`SkipDryRunOnMissingResource=true` DOES belong on the ClusterIssuer, per 3.4 — that one is a CRD-backed kind
+which genuinely may not be served yet.
+
+### 3.9 `[ count -ge 3 ]`
 
 A magic number that matches today's three deployments (`cert-manager`, `cert-manager-cainjector`,
 `cert-manager-webhook`, all 1/1). A version shipping four would satisfy it after three; one shipping two
@@ -162,8 +190,11 @@ so the chart asks the operator what it installs.
 
 - The `venafi-certificate-sample` chart.
 - `scripts/*.sh` beyond qualifying resource names — they are operator-run helpers, not part of the release.
-- The ClusterIssuer currently reporting `False / ErrorSetup` on the cluster. That is a TPP connectivity or
-  credential matter, not an ordering one, and it should be diagnosed separately rather than folded in here.
+- The ClusterIssuer currently reporting `False / ErrorSetup` on the cluster. **Confirmed acceptable by the
+  operator** — there is no live TPP issuer backing this lab release, so `ErrorSetup` is the expected state
+  and not a symptom of anything in this plan. Recorded here so a future reader does not mistake it for a
+  regression introduced by these changes, and so the verification in section 5 does not treat it as a
+  failure to fix.
 
 ## 5. How each change gets validated
 
