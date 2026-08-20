@@ -179,12 +179,23 @@ applies. The sibling group-sync chart carries that pair on its Jobs and it is ca
 `SkipDryRunOnMissingResource=true` DOES belong on the ClusterIssuer, per 3.4 — that one is a CRD-backed kind
 which genuinely may not be served yet.
 
-### 3.9 `[ count -ge 3 ]`
+### 3.9 `[ count -ge 3 ]` — the problem stands, my proposed source was wrong
 
 A magic number that matches today's three deployments (`cert-manager`, `cert-manager-cainjector`,
 `cert-manager-webhook`, all 1/1). A version shipping four would satisfy it after three; one shipping two
-would hang until timeout. Derive the expectation from the CSV's own `.spec.install.spec.deployments` instead,
-so the chart asks the operator what it installs.
+would hang until timeout. It also cannot tell "all three Available" from "the first of three exists".
+
+**RETRACTED: "derive it from the CSV's `.spec.install.spec.deployments`."** Measured — that field lists
+`cert-manager-operator-controller-manager` and nothing else. It is the OPERATOR's own Deployment, not the
+operands, so the CSV is not a source of truth for this at all.
+
+The real source is `certmanagers.operator.openshift.io/cluster`, whose status publishes one condition per
+component the operator manages. Measured on the cluster: `cert-manager-controller`, `cert-manager-webhook`
+and `cert-manager-cainjector`, each with `Available`/`Progressing`/`Degraded`. The gate now requires every
+`*-deploymentAvailable` to be `True`, and refuses to pass when zero such conditions exist so a rename of the
+scheme fails loudly instead of reading as "nothing to wait for". It needed one new RBAC rule —
+`get/list/watch` on `certmanagers` in `operator.openshift.io` — and the verify SA was confirmed DENIED it
+beforehand, which is why the rule shipped with the change rather than after it.
 
 ### 3.10 No `required` on the identifiers the verify Job depends on
 
@@ -273,3 +284,137 @@ and three of the hardest-won lessons are **already implemented here**. Those are
 | `$( )` strips trailing newlines, so `wc -l` counts separators and `while read` drops the last line | the sweeper printing 4 live CRs where 5 existed | **not applicable** — the one `wc -l` is on a live pipeline, not a captured string |
 | `crds/` is the only Helm mechanism early enough for an *ordinary* CR | NCO first install | **not applicable, and validated as such** — see section 2. The CR here is a hook behind a gate, and Helm re-discovers per hook. |
 | Under ArgoCD, `crds/` is rendered by `--include-crds`, so set `skipCrds: true` | group-sync vendored CRD | **not applicable** — no `crds/` here, which is precisely why not vendoring is the better answer |
+
+## 7. Retractions and findings from implementing it
+
+Everything here was found by building and deploying, not by reading. Four items are corrections to this
+document; the rest are problems the plan never anticipated.
+
+### 7.1 RETRACTED — "fail fast on a Degraded component"
+
+The first version of stage 3 aborted on any `Degraded=True`. A cold-start test killed that idea twice over.
+Measured immediately after reinstalling the operator: all three components reported
+`deploymentAvailable=True` **and** `deploymentDegraded=True` simultaneously, with every operand Deployment
+1/1 and the webhook serving admission. The reason was
+`SyncError: (Retrying) trusted CA config map "trusted-ca" doesn't exist` — a condition still `True` minutes
+after the ConfigMap had been recreated, because the operator had not re-reconciled.
+
+So Degraded is neither terminal nor necessarily current. **Available is the gate; Degraded is context** —
+logged so a stalled run explains itself, and repeated in the timeout message where it is genuinely
+diagnostic.
+
+### 7.2 The trusted-CA ConfigMap was in the wrong wave — mine
+
+The plan put it at wave 1 with the other prerequisites. Wrong: the Subscription sets
+`TRUSTED_CA_CONFIGMAP_NAME` to it, so the operator looks for it the moment OLM starts it. At wave 1 the
+operator starts first, does not find it, and marks every component `SyncError` until the wave lands. Moved to
+**wave -1**, before the Subscription. It has no dependencies of its own — OpenShift's network operator fills
+`ca-bundle.crt` from the label — so nothing justified making it wait.
+
+### 7.3 The orphaned CSV — the biggest gap, and it was already solved next door
+
+`helm uninstall` removes the Subscription but OLM **leaves the CSV behind with no ownerReferences**, so
+nothing garbage-collects it. The next install cannot resolve:
+
+```
+ResolutionFailed: constraints not satisfiable: @existing/cert-manager-operator//cert-manager-operator.v1.19.1
+```
+
+and **no InstallPlan is ever staged**, so the approver waits out its whole budget for something that cannot
+arrive. Hit exactly that: a reinstall sat at `pending-install` and only recovered because I deleted the CSV by
+hand — the manual interference this work exists to remove.
+
+The sibling `namespace-configuration-operator` chart had already diagnosed this in
+`06a-csv-reclaim-job.yaml`, with the measurement in its header: with the reclaim behind the approver, the
+approver waited 03:26:53→03:30:29 and the install recovered only because a CronJob happened to fire. **Ported
+rather than re-derived**, including the ordering (helm weight -6, ahead of the approver at -5) and the six
+conditions required before deleting a CSV the chart does not own — of which `olm.copiedFrom` matters most,
+because AllNamespaces mode copies the CSV into every namespace and every copy looks unowned.
+
+Validated end to end: Subscription deleted, CSV left orphaned, then a plain `helm upgrade` self-healed —
+reclaim cleared it, OLM re-resolved, the approver approved a fresh InstallPlan, the gate passed.
+
+### 7.4 Two approver gaps, both from the cold-start test
+
+- It read `.status.installedCSV` **once** before the search loop. OLM does not always stage a plan — it can
+  adopt an existing CSV and set `installedCSV` directly — so the approver would wait out its budget and fail
+  an install that had succeeded. Now re-read every iteration.
+- It had **no `ResolutionFailed` guard**, so an unresolvable Subscription was indistinguishable from a slow
+  one. Now it aborts naming the orphan case and the command to fix it.
+
+### 7.5 The reclaim cost every clean install two minutes — also mine
+
+It waited for OLM's verdict before deciding, but on a clean install neither `installedCSV` nor
+`ResolutionFailed` appears until the InstallPlan is approved, and the approver runs *after* it by design.
+Measured: the full 120s burned, then "no verdict; taking no action". Correct outcome, wasted time.
+
+Fixed by asking the cheap question first: is there any CSV here that is not an OLM copy, has no
+ownerReferences and is referenced by no Subscription? If none, nothing can be orphaned whatever OLM later
+decides. Measured after: **4s instead of 120s**.
+
+### 7.6 The chart deleted namespaces it did not exclusively own
+
+`namespaces.create: true` puts both Namespaces in the release, so `helm uninstall` deletes them — and a
+namespace deletion takes everything inside. Measured: the operand namespace held the **root CA Secret of an
+unrelated LDAP TLS chain**, the TPP credentials Secret and the webhook CA. Removing a Subscription would have
+broken LDAPS for a service with no connection to this release.
+
+Added `namespaces.protectOnUninstall` (default **true**), which stamps `helm.sh/resource-policy: keep`. Note
+Helm reads that from the **stored release manifest**, not the live object, so annotating a namespace by hand
+after the fact does nothing — it must be in the chart and stored by an upgrade. Verified across four
+uninstall/install cycles: both namespaces survived and the root CA kept its original UID.
+
+### 7.7 Both CA options must share a slot
+
+The trusted-CA ConfigMap and the ca-pull Job are flag-selected alternatives for obtaining the root CA, so
+they occupy the **same position**: wave -1, with the Job at helm weight -4 and its RBAC moved to wave -2
+ahead of them. Otherwise flipping the flag silently changes *when* the CA becomes available, and whichever
+consumer needed it earlier starts failing.
+
+### 7.8 `ServerSideApply=true` on the trusted-CA ConfigMap
+
+The operator writes `data.ca-bundle.crt` and the chart ships it empty. Server-side apply lets the operator
+keep ownership of what it wrote instead of Argo reverting it every sync — which would empty the bundle and
+make external clusters unreachable until the operator refilled it. **Not sufficient alone:** the Application
+also needs an `ignoreDifferences` entry for this ConfigMap's `data`, which cannot be set from the chart.
+
+## 8. Migration requirements for an existing release
+
+None of this is automatic, and all of it was hit for real on the live release.
+
+**Adopt the RBAC that used to be hooks.** `verify-rbac`'s ServiceAccount, ClusterRole and ClusterRoleBinding
+existed with `managed-by=Helm` but **no `meta.helm.sh/release-name`** — Helm never records hook resources.
+Turning them into ordinary resources fails the upgrade with `invalid ownership metadata` unless they are
+adopted first:
+
+```
+oc annotate <kind> <name> [-n <ns>] \
+  meta.helm.sh/release-name=cert-manager-venafi \
+  meta.helm.sh/release-namespace=default --overwrite
+```
+
+Adopting beats deleting: there is no window where the RBAC is absent.
+
+**Then strip the stale hook annotations.** After the upgrade those objects still carried `helm.sh/hook`,
+`hook-weight` and `hook-delete-policy`. Helm decides hook-ness from the rendered manifest, so they *are*
+managed correctly — but an object annotated "I am a hook" while being an ordinary resource is a trap for the
+next reader. Remove with `oc annotate ... helm.sh/hook- helm.sh/hook-weight- helm.sh/hook-delete-policy-`.
+
+**Never `helm upgrade` this chart without its original values.** `scripts/install.sh` passes TPP credentials
+via `--set tppCredentials.create=true --set tppCredentials.usernameBase64=...`. An upgrade without them
+resets to chart defaults where `create: false`, which drops the Secret from the manifest and Helm prunes it.
+That destroyed `tpp-secret` on this cluster, unrecoverably — `helm uninstall` also deletes the release
+history, so the stored values were gone with it. Run `helm get values <release> -n <ns>` first and carry them
+forward, or better: **deliver credentials out-of-band**, as `values.yaml` already recommends. A secret Helm
+does not own cannot be pruned by Helm — verified, the replacement survived a subsequent uninstall untouched.
+
+## 9. The process lesson
+
+The single most useful correction during this work was being told to use the two sibling charts as a cheat
+sheet rather than re-deriving. The orphaned-CSV reclaim, its weight relative to the approver, the six
+conditions, the `olm.copiedFrom` trap, the "hooks are never recorded" consequence and the qualified-resource
+rule were all already solved and documented in `openshift-rbac-automation` and
+`group-sync-operator-helm-chart`. Reading them first would have skipped a hand-deleted CSV, a wasted vendoring
+plan and two failed installs.
+
+Check those charts before designing anything here.
