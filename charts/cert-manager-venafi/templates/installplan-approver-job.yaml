@@ -231,7 +231,7 @@ spec:
                 something this Job will do for you.
 
                 What is installed:  oc get ${SUBS} ${SUBSCRIPTION} -n ${NAMESPACE} -o jsonpath='{.status.installedCSV}'
-                What is on offer:   oc get packagemanifest ${SUBSCRIPTION} -n {{ .Values.operator.sourceNamespace }} -o jsonpath='{range .status.channels[*]}{.name}{" -> "}{.currentCSV}{"\n"}{end}'"
+                What is on offer:   oc get packagemanifest ${SUBSCRIPTION} -n {{ .Values.operator.sourceNamespace }} -o custom-columns=CHANNEL:.status.channels[*].name,HEAD:.status.channels[*].currentCSV"
                 fi
                 # BEHIND. The pin was moved forward in git and the cluster has not caught up — the normal
                 # upgrade path. OLM stages a plan for it and the loop below approves exactly that one.
@@ -291,7 +291,7 @@ spec:
               [ -n "$TARGET" ] || fail "no unapproved InstallPlan for ${APPROVE_CSV} appeared within ${WAIT_SECONDS}s.
                 Most often operator.startingCSV names a version this channel does not offer. Check what it does:
                 oc get packagemanifest ${SUBSCRIPTION} -n {{ .Values.operator.sourceNamespace }} \\
-                -o jsonpath='{range .status.channels[*]}{.name}{\" -> \"}{.currentCSV}{\"\\n\"}{end}'
+                -o custom-columns=CHANNEL:.status.channels[*].name,HEAD:.status.channels[*].currentCSV
                 And what OLM staged:  oc get ${PLANS} -n ${NAMESPACE} -o custom-columns=NAME:.metadata.name,CSV:.spec.clusterServiceVersionNames[*],APPROVED:.spec.approved"
 
               # --- 4. approve it ----------------------------------------------------------------------

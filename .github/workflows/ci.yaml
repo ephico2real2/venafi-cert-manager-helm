@@ -124,6 +124,14 @@ jobs:
       - name: Ordering is declared, not accidental
         run: ci/ordering.py
 
+      - name: No message string closes its own quote early
+        # A `fail "..."` whose message contained a plain `"` instead of `\"` closed the string, exposing a
+        # `>` as a REDIRECT — so bash tried to write a file AND the fail never exited, letting execution fall
+        # into the wrong branch and report a wrong verdict. `bash -n` cannot catch it (a redirect is valid
+        # shell), and running it locally cannot either: on a writable filesystem the redirect succeeds
+        # silently. Only the container's read-only root surfaced it, on a live cluster.
+        run: ci/message-quoting.py
+
       - name: Every oc call names its resource in full
         # A resource plural is not reserved, so a short name can bind to a DIFFERENT API GROUP. Measured on a
         # live cluster in the sibling chart: `oc get subscription` resolved to
