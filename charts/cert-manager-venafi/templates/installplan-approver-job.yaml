@@ -242,25 +242,30 @@ spec:
                 want_v="$(printf '%s' "$APPROVE_CSV" | sed 's/^.*\.v//')"
                 newer="$(printf '%s\n%s\n' "$inst_v" "$want_v" | sort -V | tail -1)"
                 if [ "$newer" = "$inst_v" ]; then
-                  # AHEAD. OLM does not downgrade, so no InstallPlan for the pin can ever appear and waiting
-                  # is pointless. This is real drift — with installPlanApproval: Manual the operator cannot
-                  # have upgraded itself, so either a human approved a plan or the operator predates this
-                  # release adopting it. Fail immediately and say which, rather than after a long wait.
-                  fail "the cluster is running ${INSTALLED}, which is NEWER than operator.startingCSV (${APPROVE_CSV}).
-                OLM does not downgrade, so no InstallPlan for ${APPROVE_CSV} will ever be staged and waiting
-                for one is pointless — that pin describes a past state.
-
-                Almost always the fix is to adopt what is running, in git:
-                  operator.startingCSV: ${INSTALLED}
-                then re-run. The pin is what this chart declares should be running, and startingCSV is also
-                where OLM begins on a FRESH install — so it must name a version the channel still offers.
-
-                If you genuinely need ${APPROVE_CSV} instead, OLM cannot take you there: the CSV must be
-                removed and reinstalled, which takes cert-manager down. That is a deliberate act, not
-                something this Job will do for you.
-
-                What is installed:  oc get ${SUBS} ${SUBSCRIPTION} -n ${NAMESPACE} -o jsonpath='{.status.installedCSV}'
-                What is on offer:   oc get packagemanifest ${SUBSCRIPTION} -n {{ .Values.operator.sourceNamespace }} -o 'custom-columns=CHANNEL:.status.channels[*].name,HEAD:.status.channels[*].currentCSV'"
+                  # AHEAD. OLM does not downgrade, so no InstallPlan for the pin can ever appear. This is real
+                  # drift — with installPlanApproval: Manual the operator cannot have upgraded itself, so
+                  # either a human approved a plan or the operator predates this release adopting it.
+                  #
+                  # WARN AND CONTINUE, not fail. An earlier version failed here. Failing blocks every later
+                  # `helm upgrade` — and every ArgoCD sync — on a condition this Job cannot fix and that is
+                  # not itself harmful: the operator is running, newer than asked, and nothing this Job does
+                  # would change that. Blocking the release does not correct the pin; only a commit does.
+                  #
+                  # EXIT 0 RATHER THAN FALL THROUGH. The search loop below would hunt for an InstallPlan OLM
+                  # will never stage and burn the entire budget before failing — the exact behaviour reported
+                  # from a 4.20 cluster: six minutes of "waiting for OLM to stage v1.19.1" with v1.20.0 up.
+                  log "WARNING: the cluster is running ${INSTALLED}, which is NEWER than operator.startingCSV (${APPROVE_CSV})."
+                  log "  OLM does not downgrade, so no InstallPlan for ${APPROVE_CSV} will ever be staged — that pin"
+                  log "  describes a past state. This Job approves nothing and the operator stays at ${INSTALLED}."
+                  log "  Adopt what is running, in git:  operator.startingCSV: ${INSTALLED}"
+                  log "  Not merely tidiness: startingCSV is where OLM BEGINS on a fresh install, so a reinstall"
+                  log "  would start at ${APPROVE_CSV} instead of ${INSTALLED}."
+                  log "  Going back to ${APPROVE_CSV} is not something this Job will do — OLM cannot downgrade, so"
+                  log "  the CSV would have to be removed and reinstalled, taking cert-manager down."
+                  log "  What is on offer: oc get packagemanifest ${SUBSCRIPTION} -n {{ .Values.operator.sourceNamespace }} -o 'custom-columns=CHANNEL:.status.channels[*].name,HEAD:.status.channels[*].currentCSV'"
+                  # Worth knowing while ahead: a FURTHER upgrade may already be staged and waiting.
+                  report_unapproved_others
+                  exit 0
                 fi
                 # BEHIND. The pin was moved forward in git and the cluster has not caught up — the normal
                 # upgrade path. OLM stages a plan for it and the loop below approves exactly that one.
