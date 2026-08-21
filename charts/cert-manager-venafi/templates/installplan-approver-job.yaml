@@ -311,13 +311,18 @@ spec:
                 want_v="$(csv_version "$APPROVE_CSV")"
 
                 if [ "$inst_v" = "$want_v" ]; then
-                  # Same version, spelled two ways — what a half-finished catalog rename looks like. On raw
-                  # names this skips the equality branch above and gets reported as the cluster being NEWER
-                  # than an identical version. Nothing to approve either way, but the pin still needs fixing
-                  # in git: the approve and verify steps below match CSV names byte-for-byte, so a pin
-                  # spelled differently from the catalog can classify forever yet never approve anything.
-                  log "already installed at version ${inst_v} — but the cluster spells it ${INSTALLED} and the pin spells it ${APPROVE_CSV}"
-                  log "  update operator.startingCSV to the exact spelling the cluster reports; approval matches CSV names byte-for-byte, so the spellings must agree before the next upgrade"
+                  # Same version behind two DIFFERENT names, and the reader cannot be assumed to know
+                  # which case they are in: a catalog rename that dropped the `v` (spelling), or a pin
+                  # that names the wrong package outright at a version the real operator happens to
+                  # share. The message states both causes and prints both names whole rather than
+                  # computing which segment differs — the names sit side by side, and the remedy is
+                  # identical either way: make the pin byte-for-byte what the cluster reports, because
+                  # the approve and verify steps below match CSV names exactly, so a pin the catalog
+                  # never stages can classify forever yet never approve anything.
+                  log "already installed at version ${inst_v} — but the installed CSV is named ${INSTALLED} and the pin says ${APPROVE_CSV}"
+                  log "  the difference is either a v dropped by a catalog rename or a pin naming the wrong package;"
+                  log "  either way, update operator.startingCSV to the exact name the cluster reports — approval"
+                  log "  matches CSV names byte-for-byte, so they must agree before the next upgrade"
                   report_unapproved_others
                   exit 0
                 fi

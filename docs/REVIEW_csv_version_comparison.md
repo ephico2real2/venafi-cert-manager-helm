@@ -643,14 +643,19 @@ Do not apply anything yet.
 
 ### 5. Failure modes deliberately NOT fixed
 
-> **Fable:** 1. **A pre-release as `installedCSV` against its own final pin still reads AHEAD**
-> (matrix row: `v1.20.1-rc.1` vs `v1.20.1`), because `sort -V` orders the rc after its final. This is
-> byte-identical to today's verdict, and it is the SAFE wrong answer: the Job approves nothing, warns,
-> and exits 0 — no budget burn, and the log prints both names. Fixing it means a semver-aware
-> comparator hand-rolled in shell for a shape this catalog has never published (12 of 12 CSVs are
-> plain `vX.Y.Z`) and that the guard refuses as a pin. Note the other three rc rows are actually
-> CORRECT under `sort -V` (rc vs an older final, rc vs a newer final, rc pin measured in run 3), so
-> the exposure is exactly one pair, in the harmless direction.
+> **Fable:** 1. **A pre-release as `installedCSV` against its own final pin reads AHEAD** (`v1.20.1-rc.1` vs
+>    `v1.20.1`), because `sort -V` orders an rc after its final. CHEAP is the honest word, not SAFE:
+>    no budget burns, but the Job blocks an upgrade the pin explicitly asked for, logs that the
+>    cluster is NEWER than the pin — false; an rc precedes its final — and advises adopting an rc
+>    name the render guard will refuse. Measured in pass 2: the staged InstallPlan for the pinned
+>    final is INVISIBLE in the Job's own report, because report_unapproved_others deliberately skips
+>    plans matching the pin — the log closes with no other unapproved InstallPlans are waiting while
+>    exactly that plan waits. Left because it is unreachable under this chart's own gate: the catalog
+>    has never published a pre-release (12 of 12 finals), the guard refuses rc pins, and this Job
+>    approves only pins — a running rc means a human approved one around the gate. Recovery is one
+>    command on the plan the report does not show: list installplans.operators.coreos.com in the
+>    namespace and approve the one naming the final. The one-pattern rule fixing exactly this pair
+>    is verified and recorded in pass 2 §2 — re-verify before applying.
 >
 > 2. **An rc PIN would classify BEHIND and burn the budget — so the guard keeps refusing it** (run 3
 > output above). Not a fix deferred; a fix refused: render-time rejection is strictly better than any
@@ -663,23 +668,357 @@ Do not apply anything yet.
 > names, where the replacement confines it to v-less names only (and measurably beats the baseline
 > on dotted v-ful names, §1).
 >
-> 4. **A wholly alien `installedCSV`.** A dotless name (`garbage`) compares raw and lands AHEAD —
-> safe, measured (digits sort before letters, so the numeric pin is never the newer side). The one
-> pathological spelling that misclassifies expensively is a name ending in `.v` with no version
-> (`cert-manager-operator.v` → empty → BEHIND → search-loop wait, run 3). OLM writes `installedCSV`
-> only from a CSV it actually installed, and no such CSV name can exist in a catalog; if it ever
-> happens, the search loop's existing timeout message names the exact diagnostic commands. Guarding
-> a value only OLM can write, against a shape OLM cannot write, is dead code.
+> 4. **A wholly alien `installedCSV`.** Letter-leading junk (`garbage`, `pkg.1.2.3`) always sorts
+>    AFTER a numeric pin — measured across five shapes in pass 2, not one lucky example — so it lands
+>    AHEAD: approve nothing, warn, exit 0, cheap, though the NEWER wording is false for a name with
+>    no version in it. Digit-leading junk follows its leading number (`2service`: AHEAD of `1.19.1`,
+>    BEHIND `3.0.0` — measured), and the empty extraction from a name ending in bare `.v` sorts
+>    before everything, so those can land BEHIND: the search loop, the full budget, then a red
+>    release whose log prints both strings. Left in both directions for the same two reasons:
+>    installedCSV is written only by OLM from a CSV a catalog actually served, and no catalog
+>    toolchain emits such names — the API alone does not forbid them, which is as far as cannot
+>    happen honestly goes; and for a Subscription state nothing recognizes, the loud late failure is
+>    the RIGHT outcome. A check that converted it into a green exit would hide an anomaly this Job
+>    cannot interpret (pass 2 §1 evaluates and declines exactly that check).
 >
-> 5. **A pin naming the wrong PACKAGE at the same version** (`wrong-operator.v1.19.1` against an
-> installed `cert-manager-operator.v1.19.1`) reports as the same version spelled two ways and exits
-> 0. The message prints both full names side by side and directs the reader to make the pin match
-> the cluster's spelling exactly — which surfaces the wrong package name to a human. Package
-> identity is bound by the Subscription lookup in step 1, not by this comparison; teaching the
-> version comparator to parse package identity would duplicate that job, badly.
+> 5. **A pin naming the wrong PACKAGE at the same version** (`cert-manger-operator.v1.19.1` against
+>    an installed `cert-manager-operator.v1.19.1`) lands in the equal-version branch and exits 0.
+>    Fixed at the message level in pass 2: the branch no longer asserts a spelling difference — it
+>    prints both full names and names both possible causes (a catalog rename dropping the v, or a
+>    pin naming the wrong package), with the identical remedy: make the pin byte-for-byte what the
+>    cluster reports. Computing WHICH segment differs was declined — logic to state what two
+>    adjacent names already show. Package identity is bound by the Subscription lookup in step 1,
+>    not by this comparison.
 >
-> 6. **A well-formed pin for a version the channel never offers** (`v9.9.9`) still classifies BEHIND
-> and waits out the search loop into its existing failure message ("most often operator.startingCSV
-> names a version this channel does not offer", with the `packagemanifest` command). No string
-> comparison can know the catalog's contents; the timeout path already names the cause and the
-> probe.
+> 6. **A well-formed pin for a version the channel never offers** (`v9.9.9`) classifies BEHIND,
+>    waits out the search loop, and fails with the existing message naming the packagemanifest
+>    probe. Correct — but for a better-measured reason than pass 1 gave. Pass 1 said no string
+>    comparison can know the catalog's contents; true of the comparison, not of the Job: this
+>    cluster's PackageManifest API exposes the channel's full entries list (measured in pass 2), so
+>    a fail-fast IS technically possible. It stays out because the wait is load-bearing — a pin
+>    merged ahead of a catalog update becomes approvable the moment the catalog refreshes mid-wait,
+>    and the loop re-reads every 5 seconds precisely to catch late-staged plans; because an entries
+>    snapshot at Job start can be stale in exactly that window, turning a legitimate early pin into
+>    a false failure; and because it would widen the Role (get on packagemanifests) for a path whose
+>    behaviour is already correct.
+
+## Fable — pass 2
+
+### 0. The correction, accepted — and the invariant that frames every verdict below
+
+> **Fable:** The mode-1 correction is accepted: SAFE was the wrong word, and the measured picture is
+> worse than CHEAP conveys — see mode 1 below, where probe E shows the Job not only blocks the intended
+> upgrade under a false NEWER message, but its own report actively hides the one InstallPlan that
+> matters. My §5 wording overstated the comfort; replacement text is in §3 of this pass.
+
+> **Fable:** The frame for every verdict: **no cell of the §5 table can produce a wrong approval.**
+> Approval happens only in the search loop, which matches `.spec.clusterServiceVersionNames` against
+> `APPROVE_CSV` byte-for-byte — and `APPROVE_CSV` passed the render guard. A wrong verdict in the
+> comparison can therefore cost exactly two things: TIME (the 600s budget, then a red release whose log
+> carries both strings and the diagnostic commands) or TONE (a no-op exit 0 under an imperfect message).
+> Neither can install the wrong operator. Every LEAVE below leans on this bound.
+
+### 1. The one-normalisation question: it exists, it covers MORE than modes 3/4a/4b — and I still recommend against it
+
+> **Fable:** The single check the coordinator asked about exists, and it is smaller than three fixes
+> would be — one `case` pattern on the extraction result. Measured in the image (`fable-csvcmp-4`,
+> probe C): it classifies as UNCOMPARABLE the empty extraction from `pkg.v` (mode 4b), the dotted-package
+> v-less extraction `pkg.1.2.3` (mode 3), letter-leading junk `garbage` (mode 4a), digit-leading junk
+> `2service` (mode 4a's other half, see probe B), **and** `1.20.1-rc.1` — the hyphen means it also
+> catches mode 1. Clean versions (`1.19.1`, `1`, `1.19`) pass. The pattern's blind spot — dot anomalies
+> like `1..2` or a trailing dot — is closed by the input domain: a Kubernetes object name is a DNS-1123
+> subdomain, which cannot contain empty labels or end in a dot, so `csv_version` cannot emit those.
+>
+> ```bash
+> # NOT APPLIED — evaluated in pass 2 and declined; recorded so nobody re-derives it. Verified
+> # 2026-08-21 in ose-cli (RHEL 8.10, bash 4.4.20, coreutils 8.30) — re-verify before ever applying;
+> # recorded-but-unapplied snippets in this file have rotted before (see the pass-1 dotted-package
+> # finding against the previously recorded baseline).
+>                 case "$inst_v" in
+>                   ''|*[!0-9.]*)
+>                     log "cannot read an orderable version out of ${INSTALLED} — approving nothing"
+>                     report_unapproved_others
+>                     exit 0 ;;
+>                 esac
+> ```
+>
+> **Fable:** Recommendation: **do not apply it.** Three reasons, in order of weight.
+>
+> 1. **Nothing reachable pays for it.** Every shape it catches requires `installedCSV` — a value written
+>    only by OLM, from a CSV a catalog actually served — to carry a name no catalog toolchain emits and
+>    this catalog has never held (12 of 12 CSVs are `<package>.vX.Y.Z`; probe on the live cluster below
+>    shows the channel's own entries list, all v-ful). The render guard earns its lines by standing in
+>    front of USER-typed input, where typos are reachable; this check would stand in front of machine
+>    state.
+> 2. **It would convert the one expensive cell into the wrong kind of cheap.** Mode 4b today burns the
+>    budget and fails RED, with both strings in the log — for a Subscription state nothing recognizes,
+>    that loud, late failure is the correct outcome. The check would exit 0 and let the release go GREEN
+>    while something unexplained sits in the Subscription status. The pass-1 render-guard principle cuts
+>    the other way here: a loud failure beats a silent wrong verdict, and a green release over an
+>    unreadable installedCSV would be exactly that.
+> 3. **For mode 1 it improves only the message.** The upgrade the operator pinned would still not be
+>    approved; the staged plan would still sit invisible. An honest message on an unreachable path is
+>    not worth a branch on every reachable one.
+>
+> If the calculus ever changes — the catalog starts publishing pre-releases, or drops the toolchain
+> convention — the snippet above is the starting point, and the bar for applying it changes with the
+> reachability.
+
+### 2. Per-mode verdicts
+
+> **Fable:** **Mode 1 — LEAVE the code; FIX the §5 wording (text in §3).** Reachability: for the cluster
+> to RUN a pre-release under this chart's own regime, the catalog must publish one (0 of 12 ever) AND a
+> human must have approved it around the gate — the render guard refuses rc pins, and this Job approves
+> nothing but the pin, so the gate itself can never have installed it. Consequence when it happens,
+> sharpened by probe E beyond the coordinator's correction: the AHEAD message is false (an rc precedes
+> its final), the adopt-what-is-running advice names an rc the guard will refuse at render, and the
+> staged InstallPlan for the pinned final is INVISIBLE in the report — `report_unapproved_others`
+> deliberately skips plans matching the pin, so the log closes with `no other unapproved InstallPlans
+> are waiting` while exactly that plan waits. Recovery is one command on the plan the report does not
+> show: list `installplans.operators.coreos.com` in the namespace and approve the one naming the final.
+> The narrow rule that fixes exactly this pair — an installed `<pin-version>-<suffix>` is BEHIND its own
+> final — is a one-pattern `case` verified in probe D (`"$want_v"-*` matches `1.20.1-rc.1` against
+> `1.20.1`, does not false-match `1.20.10`, does not over-match against a `1.20` pin); it would slot
+> between the bare-version equality test and the `sort -V` ordering and fall through to the search loop.
+> Recorded here for the day the catalog publishes a pre-release; not proposed now, for the same
+> reachability reason as everything else in this pass. A general semver comparator in shell fails the
+> bar outright, as the coordinator anticipated — thirty-odd lines against a shape never published.
+
+> **Fable:** **Mode 2 — LEAVE, confirmed: no code.** The render guard IS the fix, and a runtime
+> duplicate would test a value produced by the very render the guard already gated — `APPROVE_CSV` is
+> baked into the Job env from the same `operator.startingCSV` the `regexMatch` passed, so the two cannot
+> diverge. The only bypass is hand-editing the rendered manifest, which no in-chart check can defend
+> against. Dead code by construction, not just by reachability.
+
+> **Fable:** **Mode 3 — LEAVE: no code.** Requires the hypothetical catalog v-drop AND a dotted package
+> name at once, and this chart's package has no dot. Its cheapness is not the luck of one example:
+> probe A shows every letter-leading extraction (`pkg.1.2.3`, `a`, `zzz`, `ery`, `garbage`) sorting
+> AFTER a numeric pin under this image's `sort -V`, so the whole family lands AHEAD — approve nothing,
+> exit 0.
+
+> **Fable:** **Mode 4a — LEAVE: no code, with one sharpening to put on the record.** The coordinator's
+> row (`garbage` → AHEAD, cheap) generalizes to all LETTER-leading junk (probe A). It does NOT
+> generalize to digit-leading junk: probe B shows `2service` AHEAD of a `1.19.1` pin but BEHIND a
+> `3.0.0` pin — digit-leading junk follows its leading number and can land in the expensive direction.
+> Same unreachable family, same bounded blast radius (a loud timeout, never a wrong approval), same
+> verdict.
+
+> **Fable:** **Mode 4b — LEAVE, my pass-1 argument re-argued and partly overturned.** The phrase I used
+> — guarding a value only OLM can write against a shape OLM cannot write — was too strong: the API does
+> not forbid a CSV named `pkg.v` (any DNS-1123 subdomain is a legal object name); what makes it
+> unreachable is the catalog toolchain convention plus this catalog's 12-of-12 history. The sharper and
+> better argument is the one in §1: 4b's expense is not a defect to cheapen but the correct price of
+> refusing to guess. The 600 seconds buy a RED release with both strings and the diagnostic commands in
+> the log, on a Subscription state nothing recognizes; the alternative is GREEN over the same anomaly.
+> Expensive-and-loud is the right cell of the matrix for this input. No code.
+
+> **Fable:** **Mode 5 — FIX, message-only; full drop-in in §4.** The coordinator's question was whether
+> the message should name the package mismatch explicitly rather than only printing both spellings. It
+> should — and the cheapest honest way is to make the MESSAGE name both possible causes, not to make the
+> CODE compute which one applies. The current wording asserts a spelling difference; for a wrong-package
+> pin (reachable: a values.yaml copy-paste from another chart, a typo the guard cannot catch because the
+> shape is fine) that assertion is false, and the reader deserves the hint. Computing the prefix
+> difference was considered and declined: it is five lines of logic to state what the two adjacent
+> printed names already show, and the remedy is identical either way — make the pin byte-for-byte what
+> the cluster reports. Probe F ran the exact proposed lines in the image against both causes.
+
+> **Fable:** **Mode 6 — LEAVE, confirmed: no code — but one of my own pass-1 justifications is hereby
+> refuted, by a measurement I took before repeating it.** Pass 1 §5 said no string comparison can know
+> the catalog's contents, implying a fail-fast is impossible. The comparison cannot — but the Job could:
+> measured on this cluster, the PackageManifest API exposes the channel's FULL entries list
+> (`.status.channels[0].entries`, nine v-ful entries on `stable-v1`; output in §5). A fail-fast is
+> technically possible and still wrong, for three reasons: the wait is load-bearing for a real workflow
+> — a pin merged ahead of a catalog update becomes approvable the moment the catalog refreshes mid-wait,
+> and the loop re-reads every 5 seconds precisely so late-staged plans are caught; an entries snapshot
+> taken at Job start can be stale in exactly the window that matters, turning a legitimate early pin
+> into a false failure; and it would need `get` on packagemanifests added to the Role for a path whose
+> current behaviour the coordinator's own table already scores as CORRECT. Expensive-but-correct stays.
+
+### 3. Proposed §5 wording replacements (items 1, 4, 5, 6 — pass-1 text left in place per instructions)
+
+> **Fable:** Replacement for §5 item 1:
+>
+> ```
+> 1. **A pre-release as `installedCSV` against its own final pin reads AHEAD** (`v1.20.1-rc.1` vs
+>    `v1.20.1`), because `sort -V` orders an rc after its final. CHEAP is the honest word, not SAFE:
+>    no budget burns, but the Job blocks an upgrade the pin explicitly asked for, logs that the
+>    cluster is NEWER than the pin — false; an rc precedes its final — and advises adopting an rc
+>    name the render guard will refuse. Measured in pass 2: the staged InstallPlan for the pinned
+>    final is INVISIBLE in the Job's own report, because report_unapproved_others deliberately skips
+>    plans matching the pin — the log closes with no other unapproved InstallPlans are waiting while
+>    exactly that plan waits. Left because it is unreachable under this chart's own gate: the catalog
+>    has never published a pre-release (12 of 12 finals), the guard refuses rc pins, and this Job
+>    approves only pins — a running rc means a human approved one around the gate. Recovery is one
+>    command on the plan the report does not show: list installplans.operators.coreos.com in the
+>    namespace and approve the one naming the final. The one-pattern rule fixing exactly this pair
+>    is verified and recorded in pass 2 §2 — re-verify before applying.
+> ```
+>
+> **Fable:** Replacement for §5 item 4:
+>
+> ```
+> 4. **A wholly alien `installedCSV`.** Letter-leading junk (`garbage`, `pkg.1.2.3`) always sorts
+>    AFTER a numeric pin — measured across five shapes in pass 2, not one lucky example — so it lands
+>    AHEAD: approve nothing, warn, exit 0, cheap, though the NEWER wording is false for a name with
+>    no version in it. Digit-leading junk follows its leading number (`2service`: AHEAD of `1.19.1`,
+>    BEHIND `3.0.0` — measured), and the empty extraction from a name ending in bare `.v` sorts
+>    before everything, so those can land BEHIND: the search loop, the full budget, then a red
+>    release whose log prints both strings. Left in both directions for the same two reasons:
+>    installedCSV is written only by OLM from a CSV a catalog actually served, and no catalog
+>    toolchain emits such names — the API alone does not forbid them, which is as far as cannot
+>    happen honestly goes; and for a Subscription state nothing recognizes, the loud late failure is
+>    the RIGHT outcome. A check that converted it into a green exit would hide an anomaly this Job
+>    cannot interpret (pass 2 §1 evaluates and declines exactly that check).
+> ```
+>
+> **Fable:** Replacement for §5 item 5 (assumes the §4 drop-in below is applied):
+>
+> ```
+> 5. **A pin naming the wrong PACKAGE at the same version** (`cert-manger-operator.v1.19.1` against
+>    an installed `cert-manager-operator.v1.19.1`) lands in the equal-version branch and exits 0.
+>    Fixed at the message level in pass 2: the branch no longer asserts a spelling difference — it
+>    prints both full names and names both possible causes (a catalog rename dropping the v, or a
+>    pin naming the wrong package), with the identical remedy: make the pin byte-for-byte what the
+>    cluster reports. Computing WHICH segment differs was declined — logic to state what two
+>    adjacent names already show. Package identity is bound by the Subscription lookup in step 1,
+>    not by this comparison.
+> ```
+>
+> **Fable:** Replacement for §5 item 6:
+>
+> ```
+> 6. **A well-formed pin for a version the channel never offers** (`v9.9.9`) classifies BEHIND,
+>    waits out the search loop, and fails with the existing message naming the packagemanifest
+>    probe. Correct — but for a better-measured reason than pass 1 gave. Pass 1 said no string
+>    comparison can know the catalog's contents; true of the comparison, not of the Job: this
+>    cluster's PackageManifest API exposes the channel's full entries list (measured in pass 2), so
+>    a fail-fast IS technically possible. It stays out because the wait is load-bearing — a pin
+>    merged ahead of a catalog update becomes approvable the moment the catalog refreshes mid-wait,
+>    and the loop re-reads every 5 seconds precisely to catch late-staged plans; because an entries
+>    snapshot at Job start can be stale in exactly that window, turning a legitimate early pin into
+>    a false failure; and because it would widen the Role (get on packagemanifests) for a path whose
+>    behaviour is already correct.
+> ```
+
+### 4. Mode-5 drop-in code
+
+> **Fable:** Replaces the equal-version branch of the deployed template,
+> `charts/cert-manager-venafi/templates/installplan-approver-job.yaml` lines 313–323 (commit
+> `fddf6d0`), from `if [ "$inst_v" = "$want_v" ]; then` through its closing `fi`. Indentation matches
+> the file (branch body at 18 spaces). Logic identical to what ships — the change is the comment and
+> the four message lines, which contain no double-quote characters and were run verbatim in the image
+> (probe F):
+>
+> ```bash
+>                 if [ "$inst_v" = "$want_v" ]; then
+>                   # Same version behind two DIFFERENT names, and the reader cannot be assumed to know
+>                   # which case they are in: a catalog rename that dropped the `v` (spelling), or a pin
+>                   # that names the wrong package outright at a version the real operator happens to
+>                   # share. The message states both causes and prints both names whole rather than
+>                   # computing which segment differs — the names sit side by side, and the remedy is
+>                   # identical either way: make the pin byte-for-byte what the cluster reports, because
+>                   # the approve and verify steps below match CSV names exactly, so a pin the catalog
+>                   # never stages can classify forever yet never approve anything.
+>                   log "already installed at version ${inst_v} — but the installed CSV is named ${INSTALLED} and the pin says ${APPROVE_CSV}"
+>                   log "  the difference is either a v dropped by a catalog rename or a pin naming the wrong package;"
+>                   log "  either way, update operator.startingCSV to the exact name the cluster reports — approval"
+>                   log "  matches CSV names byte-for-byte, so they must agree before the next upgrade"
+>                   report_unapproved_others
+>                   exit 0
+>                 fi
+> ```
+
+### 5. Measurements — pod `fable-csvcmp-4` on `registry.redhat.io/openshift4/ose-cli:latest`, plus one read-only cluster probe
+
+> **Fable:** Same `oc run --rm` pattern as pass 1, unique pod name, script on stdin. Environment from
+> inside the image:
+>
+> ```
+> PRETTY_NAME="Red Hat Enterprise Linux 8.10 (Ootpa)"
+> GNU bash, version 4.4.20(1)-release (x86_64-redhat-linux-gnu)
+> sort (GNU coreutils) 8.30
+> ```
+>
+> ```
+> === A. letter-leading extractions vs a numeric pin: which side does sort -V call newer? ===
+>   pkg.1.2.3  vs 1.19.1 -> newer=pkg.1.2.3
+>   a          vs 1.19.1 -> newer=a
+>   zzz        vs 1.19.1 -> newer=zzz
+>   ery        vs 1.19.1 -> newer=ery
+>   garbage    vs 1.19.1 -> newer=garbage
+>
+> === B. digit-leading junk follows its leading number: either side is possible ===
+>   2service vs 1.19.1  -> newer=2service
+>   2service vs 3.0.0   -> newer=3.0.0
+>
+> === C. the candidate one-check normalisation (evaluated, NOT proposed): true coverage ===
+>   [] -> UNCOMPARABLE
+>   [pkg.1.2.3] -> UNCOMPARABLE
+>   [garbage] -> UNCOMPARABLE
+>   [1.20.1-rc.1] -> UNCOMPARABLE
+>   [2service] -> UNCOMPARABLE
+>   [1.19.1] -> comparable
+>   [1] -> comparable
+>   [1.19] -> comparable
+>
+> === D. the narrow rc-of-the-pinned-version rule (verified for the record, NOT proposed) ===
+>   inst_v=1.20.1-rc.1 want_v=1.20.1 -> matches-treat-as-BEHIND   (the mode-1 pair)
+>   inst_v=1.20.10     want_v=1.20.1 -> no-match   (hyphen anchors: no false hit)
+>   inst_v=1.20.1-rc.1 want_v=1.20   -> no-match   (prefix alone is not enough)
+>
+> === E. mode 1 end to end: the staged plan for the pin is INVISIBLE in the report ===
+>   -- the faked namespace state: one unapproved plan, owned by us, FOR THE PIN --
+>   plan=installplan.operators.coreos.com/install-xyz9k owner=cert-manager-operator approved=false installs=cert-manager-operator.v1.20.1
+>   -- deployed classification and report, run on that state --
+> [approver 16:38:16] WARNING: the cluster is running cert-manager-operator.v1.20.1-rc.1, which is NEWER than operator.startingCSV (cert-manager-operator.v1.20.1).
+> [approver 16:38:16]   (AHEAD transcript trimmed to the lines this probe is about)
+> [approver 16:38:16] no other unapproved InstallPlans are waiting
+>
+> === F. proposed mode-5 message, exact drop-in lines, both reachable causes ===
+>   -- wrong package, same version (a values.yaml copy-paste with a typo) --
+> [approver 16:38:16] already installed at version 1.19.1 — but the installed CSV is named cert-manager-operator.v1.19.1 and the pin says cert-manger-operator.v1.19.1
+> [approver 16:38:16]   the difference is either a v dropped by a catalog rename or a pin naming the wrong package;
+> [approver 16:38:16]   either way, update operator.startingCSV to the exact name the cluster reports — approval
+> [approver 16:38:16]   matches CSV names byte-for-byte, so they must agree before the next upgrade
+>   -- same package, catalog dropped the v --
+> [approver 16:38:16] already installed at version 1.19.1 — but the installed CSV is named cert-manager-operator.1.19.1 and the pin says cert-manager-operator.v1.19.1
+> [approver 16:38:16]   the difference is either a v dropped by a catalog rename or a pin naming the wrong package;
+> [approver 16:38:16]   either way, update operator.startingCSV to the exact name the cluster reports — approval
+> [approver 16:38:16]   matches CSV names byte-for-byte, so they must agree before the next upgrade
+> ```
+>
+> **Fable:** Probe E's fake `oc` answers the exact four queries `report_unapproved_others` makes (plan
+> list, owner, approved, CSV names), emulating a namespace holding one unapproved plan owned by our
+> Subscription that installs the pinned final; the function itself is verbatim from the deployed
+> template. The report's silence about that plan is by design — it skips pin-matching plans because in
+> the normal EQUAL path they are about to be handled — but in the AHEAD path nothing handles them, which
+> is what makes the mode-1 log actively misleading rather than merely wrong.
+>
+> **Fable:** Read-only cluster probe for mode 6 (laptop `oc`, no pod needed — this is an API-shape
+> question, not a userland one):
+>
+> ```
+> $ oc get packagemanifest openshift-cert-manager-operator -n openshift-marketplace -o jsonpath='{.status.channels[0].name}'
+> stable-v1
+> $ oc get packagemanifest openshift-cert-manager-operator -n openshift-marketplace -o jsonpath='{.status.channels[0].entries}'
+> [{"name":"cert-manager-operator.v1.19.1","version":"1.19.1"},{"name":"cert-manager-operator.v1.19.0","version":"1.19.0"},
+>  {"name":"cert-manager-operator.v1.18.1","version":"1.18.1"},{"name":"cert-manager-operator.v1.18.0","version":"1.18.0"},
+>  {"name":"cert-manager-operator.v1.17.0","version":"1.17.0"},{"name":"cert-manager-operator.v1.16.1","version":"1.16.1"},
+>  {"name":"cert-manager-operator.v1.16.0","version":"1.16.0"},{"name":"cert-manager-operator.v1.15.1","version":"1.15.1"},
+>  {"name":"cert-manager-operator.v1.15.0","version":"1.15.0"}]
+> $ ... -o json | python3 -c '...channels[0].keys()...'
+> ['currentCSV', 'currentCSVDesc', 'entries', 'name']
+> ```
+>
+> Every entry v-ful — the 12-of-12 convention holds on the live channel — and the `entries` field
+> exists, which is what makes the mode-6 fail-fast possible-but-declined rather than impossible.
+
+### 6. Summary of pass 2
+
+> **Fable:** One FIX, message-only (mode 5, code in §4). Five LEAVEs, each with its reachability
+> argument (modes 1, 2, 3, 4a, 4b) or workflow argument (mode 6). Zero new logic proposed for the
+> comparison itself. Two of my own pass-1 claims corrected in the process: SAFE was the wrong word for
+> mode 1 (and the truth is worse — the report hides the actionable plan), and the mode-6 justification
+> claimed an API limitation that does not exist on this cluster. The one-check normalisation exists,
+> covers five shapes, and is declined on the coordinator's own bar: nothing reachable pays for it, and
+> for the single expensive cell it would trade a correct red for a misleading green.
