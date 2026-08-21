@@ -204,6 +204,15 @@ Approves **only** the InstallPlan that installs `operator.startingCSV`, so a `Ma
 still installs unattended while a channel upgrade waits for a human. Without it, `Manual` blocks the first
 install too — OLM stages an unapproved InstallPlan and waits.
 
+It also warns when the Subscription **on the cluster** pins a different version than the chart declares,
+because **a `helm upgrade` cannot fix that field by itself.** Ordinary resources are applied before hooks, so
+an upgrade that fails at a hook has already written the Subscription; correct the values file and re-run, and
+Helm diffs against the last *deployed* release rather than the failed one — base and new agree, the field
+never enters the patch, and the stale value stays. Measured here: a pin planted at `v1.17.1` survived a clean
+upgrade rendering `v1.19.1`, and every upgrade after it. It is inert while the operator is installed (OLM
+reads `startingCSV` only when there is no installed CSV), which is why this warns rather than fails — but a
+**reinstall** would begin at the stale version. The warning prints the one-line `oc patch` that corrects it.
+
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `installPlanApprover.enabled` | bool | `true` | Run the approver hook (weight `-5`). Disable only if something else approves InstallPlans; with `installPlanApproval: Manual` and no approver, the first install hangs and the verify gate times out on stage 1 (which says so). |

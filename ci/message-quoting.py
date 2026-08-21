@@ -38,6 +38,20 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CHART = os.path.join(REPO, "charts", "cert-manager-venafi")
 OPENERS = re.compile(r"\b(log|fail)\s+\"")
 
+# A `-o` argument that is NOT quoted and carries a jsonpath subscript — `[*]`, `[?(...)]`, `[0]`.
+#
+# WHY, and note this is about a DIFFERENT shell than the one the Job runs. The pod is /bin/bash and these
+# strings are only ever printf'd (there is no eval), so nothing here affects the Job. The commands are for a
+# HUMAN to copy onto their laptop — and macOS has defaulted to zsh since Catalina, where an unquoted `[*]`
+# is a glob with no match:
+#
+#     zsh:1: no matches found: custom-columns=CHANNEL:.status.channels[*].name
+#
+# bash leaves an unmatched glob alone, so the same paste works there and the breakage is invisible to anyone
+# testing in bash. Found by pasting this chart's own remediation command into a mac shell. Single-quoting is
+# inert in bash and fixes zsh, so it costs nothing.
+GLOB_ARG = re.compile(r"-o\s+(?![\"'])(\S*\[[^\]]*\]\S*)")
+
 
 def offenders(script, where):
     bad = []
@@ -54,6 +68,15 @@ def offenders(script, where):
         else:
             bad.append((where, "unterminated message string"))
             continue
+        # RULE 2 — a copy-pasteable command inside the message body that globs in zsh. Scoped to the message
+        # body deliberately: the script's own `oc` calls already single-quote their jsonpaths, and they run
+        # under bash where it would not matter anyway.
+        for g in GLOB_ARG.finditer(script[m.end():i]):
+            line = script[:m.end() + g.start()].count("\n") + 1
+            bad.append((where, "line %d: message contains a copy-pasteable `-o` argument with an unquoted "
+                               "jsonpath subscript — pasting it into zsh (the macOS default) fails with "
+                               "'no matches found'. Wrap it in single quotes: >>>%s<<<"
+                        % (line, g.group(1)[:70])))
         # what follows the closing quote, up to end of line
         eol = script.find("\n", i)
         rest = script[i + 1: eol if eol != -1 else len(script)]

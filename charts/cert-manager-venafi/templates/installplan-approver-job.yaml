@@ -161,6 +161,35 @@ spec:
                 exit 0
               fi
 
+              # --- 1b. does the live Subscription still carry the pin this chart declares? --------------
+              # A HELM UPGRADE CANNOT SELF-HEAL THIS FIELD. That is why a Job has to check it.
+              #
+              # Ordinary resources are applied before hooks, so an upgrade that FAILS at a hook has ALREADY
+              # written the Subscription. Helm then computes its three-way merge against the last DEPLOYED
+              # release, not the failed one — so if you REVERT to the value that release carried, base and
+              # new agree, the field never enters the patch, and what the failed apply wrote stays. Measured:
+              # a pin planted at v1.17.1 survived a clean `helm upgrade` rendering v1.19.1, and every upgrade
+              # after it. Narrow but real: pinning a THIRD value is a genuine diff and DOES get patched
+              # (also measured — live v1.17.1 was overwritten by an upgrade rendering v1.18.1), which is why
+              # the ordinary bump-and-move-forward path never hits this.
+              #
+              # WARN, NOT FAIL: OLM reads startingCSV only when there is no installed CSV, so the drift is
+              # inert while the operator is running — failing here would block upgrades over a latent issue.
+              # The day it stops being latent is a REINSTALL, where OLM would begin at the stale version.
+              SPEC_PIN="$(oc get "$SUBS" "$SUBSCRIPTION" -n "$NAMESPACE" -o jsonpath='{.spec.startingCSV}' 2>/dev/null || true)"
+              if [ -n "$SPEC_PIN" ] && [ "$SPEC_PIN" != "$APPROVE_CSV" ]; then
+                # The remediation is a JSON patch, and JSON needs double quotes — the one character that
+                # cannot appear raw in these messages. Building it from a variable keeps the message itself
+                # quote-free, so it cannot repeat the escaping bug that turned a `fail` into a file write.
+                DQ='"'
+                PATCH="{${DQ}spec${DQ}:{${DQ}startingCSV${DQ}:${DQ}${APPROVE_CSV}${DQ}}}"
+                log "WARNING: the Subscription on the cluster pins ${SPEC_PIN}, but this chart declares ${APPROVE_CSV}."
+                log "  Helm will not reconcile this on its own — see the note above this check. It is inert while"
+                log "  the operator is installed, because OLM consults startingCSV only on a FRESH install."
+                log "  But a reinstall of this operator would begin at ${SPEC_PIN} instead of ${APPROVE_CSV}."
+                log "  Fix: oc patch ${SUBS} ${SUBSCRIPTION} -n ${NAMESPACE} --type merge -p '${PATCH}'"
+              fi
+
               # Reports any unapproved InstallPlan this Job will NOT approve, and why. Deliberately never
               # silent: refusing a plan for an unpinned version is the entire point of the gate, but a
               # refusal nobody logs is indistinguishable from an approver that failed to notice — which is
@@ -231,7 +260,7 @@ spec:
                 something this Job will do for you.
 
                 What is installed:  oc get ${SUBS} ${SUBSCRIPTION} -n ${NAMESPACE} -o jsonpath='{.status.installedCSV}'
-                What is on offer:   oc get packagemanifest ${SUBSCRIPTION} -n {{ .Values.operator.sourceNamespace }} -o custom-columns=CHANNEL:.status.channels[*].name,HEAD:.status.channels[*].currentCSV"
+                What is on offer:   oc get packagemanifest ${SUBSCRIPTION} -n {{ .Values.operator.sourceNamespace }} -o 'custom-columns=CHANNEL:.status.channels[*].name,HEAD:.status.channels[*].currentCSV'"
                 fi
                 # BEHIND. The pin was moved forward in git and the cluster has not caught up — the normal
                 # upgrade path. OLM stages a plan for it and the loop below approves exactly that one.
@@ -291,8 +320,8 @@ spec:
               [ -n "$TARGET" ] || fail "no unapproved InstallPlan for ${APPROVE_CSV} appeared within ${WAIT_SECONDS}s.
                 Most often operator.startingCSV names a version this channel does not offer. Check what it does:
                 oc get packagemanifest ${SUBSCRIPTION} -n {{ .Values.operator.sourceNamespace }} \\
-                -o custom-columns=CHANNEL:.status.channels[*].name,HEAD:.status.channels[*].currentCSV
-                And what OLM staged:  oc get ${PLANS} -n ${NAMESPACE} -o custom-columns=NAME:.metadata.name,CSV:.spec.clusterServiceVersionNames[*],APPROVED:.spec.approved"
+                -o 'custom-columns=CHANNEL:.status.channels[*].name,HEAD:.status.channels[*].currentCSV'
+                And what OLM staged:  oc get ${PLANS} -n ${NAMESPACE} -o 'custom-columns=NAME:.metadata.name,CSV:.spec.clusterServiceVersionNames[*],APPROVED:.spec.approved'"
 
               # --- 4. approve it ----------------------------------------------------------------------
               log "approving ${TARGET}"
