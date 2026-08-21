@@ -2,6 +2,28 @@
 {{- if not .Values.operator.startingCSV }}
 {{- fail "installPlanApprover is enabled but operator.startingCSV is empty. The pin IS the approval authority — with nothing to match, the approver would either approve every InstallPlan the channel produces (defeating installPlanApproval: Manual) or approve none (hanging the install). Set operator.startingCSV, or set installPlanApprover.enabled=false and approve InstallPlans by another route." }}
 {{- end }}
+{{- /*
+     The pin's SHAPE is checked here, at render time, because the Job compares versions by stripping
+     everything through `.v` and handing the remainder to `sort -V`. Two malformed shapes make that
+     comparison lie, and both were found by probing the shipped logic in the operator's own image:
+
+       cert-manager-operator.1.19.1     no `.v`, so the sed does not match and the WHOLE name is
+                                        compared. A cluster ahead of the pin is then classified BEHIND,
+                                        and the Job waits its full 600s budget for an InstallPlan OLM
+                                        will never stage before failing — ten minutes late to a correct
+                                        conclusion.
+       cert-manager-operator.v1.20.1-rc.1
+                                        `sort -V` is not semver-aware: it orders a pre-release AFTER the
+                                        release it precedes, so an rc installed against a final-release
+                                        pin reports "the cluster is NEWER" and declines to upgrade.
+
+     Requiring a numeric-dotted version after `.v` rejects both. Every CSV this package has ever offered
+     is plain vX.Y.Z (12 of 12 in the catalog), so this rejects nothing real — and it fails during
+     `helm template`, before anything touches a cluster, rather than mid-install.
+*/}}
+{{- if and .Values.operator.startingCSV (not (regexMatch "^.+\\.v[0-9]+(\\.[0-9]+)*$" .Values.operator.startingCSV)) }}
+{{- fail (printf "operator.startingCSV is %q, which is not a CSV name this chart can compare versions against. Expected <package>.v<numeric version> — for example cert-manager-operator.v1.19.1. The approver strips everything through '.v' and compares the rest with `sort -V`; a name without '.v' makes it compare the whole string (a cluster AHEAD of the pin is then misread as BEHIND, and the Job waits its full budget for an InstallPlan that will never be staged), and a pre-release suffix such as -rc.1 sorts AFTER the release it precedes, so an upgrade would be declined as 'newer'. Copy the exact name from the catalog: oc get packagemanifest %s -n %s -o 'custom-columns=CHANNEL:.status.channels[*].name,HEAD:.status.channels[*].currentCSV'. If you must pin a name in another format, set installPlanApprover.enabled=false and approve InstallPlans by another route." .Values.operator.startingCSV .Values.operator.packageName .Values.operator.sourceNamespace) }}
+{{- end }}
 # Approves ONLY the InstallPlan that installs operator.startingCSV.
 #
 # WHY IT EXISTS. installPlanApproval: Manual is the upgrade gate we want — a rolling channel must not install

@@ -53,6 +53,29 @@ jobs:
           fi
           echo "approver requires a pinned CSV"
 
+          # THE PIN'S SHAPE, not just its presence. The approver classifies ahead/behind by stripping
+          # everything through `.v` and handing the rest to `sort -V`, and two shapes make that lie —
+          # both measured against the shipped logic in the operator's own image:
+          #
+          #   no `.v`            the sed does not match, the whole name is compared, and a cluster AHEAD
+          #                      of the pin is misread as BEHIND — the Job then waits its full 600s for an
+          #                      InstallPlan OLM will never stage.
+          #   -rc.1 / -20220101  `sort -V` is not semver-aware and orders a pre-release AFTER the release
+          #                      it precedes, so an upgrade is declined as "newer".
+          #
+          # Both must be rejected at render time, before anything reaches a cluster.
+          for bad in cert-manager-operator.1.19.1 cert-manager-operator.v1.20.1-rc.1 v1.19.1; do
+            if helm template ci "$CHART" --set "operator.startingCSV=${bad}" >/dev/null 2>&1; then
+              echo "::error::operator.startingCSV=${bad} rendered, but the approver cannot compare versions against it"
+              exit 1
+            fi
+          done
+          # And the valid shapes must still render, or the guard is just breaking the chart.
+          for good in cert-manager-operator.v1.19.1 cert-manager-operator.v1.20 cert-manager-operator.v1.20.1.3; do
+            helm template ci "$CHART" --set "operator.startingCSV=${good}" >/dev/null
+          done
+          echo "pin shape is enforced, and valid shapes still render"
+
   docs:
     runs-on: ubuntu-latest
     steps:
