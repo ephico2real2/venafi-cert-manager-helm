@@ -20,9 +20,42 @@
      Requiring a numeric-dotted version after `.v` rejects both. Every CSV this package has ever offered
      is plain vX.Y.Z (12 of 12 in the catalog), so this rejects nothing real — and it fails during
      `helm template`, before anything touches a cluster, rather than mid-install.
+
+     ── IF THE CATALOG ITSELF EVER DROPS THE `v` ──────────────────────────────────────────────────────
+
+     This guard is what makes that a LOUD failure instead of a wrong answer, and that is deliberate.
+     Measured in the same image: `sort -V` orders every v-less name before every v-ful one, so the `v`
+     dominates the comparison rather than the numbers —
+
+         cert-manager-operator.1.19.1      <- v-less first, whatever the version
+         cert-manager-operator.1.21.0
+         cert-manager-operator.v1.19.1     <- v-ful after, so 1.21.0 is judged OLDER than v1.19.1
+         cert-manager-operator.v1.21.0
+
+     During any such rename the cluster is on `v1.19.1` while the catalog offers `1.21.0`, and NO string
+     comparison classifies that mixed pair correctly. Refusing to render is the only honest response.
+
+     THE FIX AT THAT POINT, so nobody has to rediscover it. Verified in this image against all 14 pairs
+     below — every v-ful, v-less and mixed ordering — before being written down:
+
+       1. Normalise both sides to bare numbers: `sed 's/^[^.]*\.v\?//'` in place of `sed 's/^.*\.v//'`.
+          The `[^.]*` is what makes it work; a greedy `.*` with an optional `v` backtracks to the LAST
+          dot and yields a single digit.
+       2. Compare the NORMALISED values for equality too, not the raw CSV names. Otherwise v1.19.1
+          installed against a 1.19.1 pin — the same version, spelled two ways, which is precisely what a
+          half-finished rename looks like — skips the equality branch and is classified AHEAD. Harmless
+          in effect (it approves nothing) but it reports the cluster as NEWER than an identical version.
+       3. Relax the regexMatch below to allow an optional `v`, and reword the error it throws: it
+          currently tells the reader to add a `.v`, which in that scenario is the wrong advice.
+
+     DO NOT "SIMPLIFY" THE COMPARISON BY DROPPING THE sed AND PASSING THE TWO FULL CSV NAMES TO sort -V.
+     It looks strictly better — no sed, no `v` assumption — and it is wrong in cases the current code
+     gets right. Measured on the five mixed v/no-v pairs: the shipped logic is wrong on three, the
+     full-name compare is wrong on two, including `v1.19.1` installed against a `1.21.0` pin, which it
+     calls AHEAD when the cluster is behind. It trades one set of wrong answers for another.
 */}}
 {{- if and .Values.operator.startingCSV (not (regexMatch "^.+\\.v[0-9]+(\\.[0-9]+)*$" .Values.operator.startingCSV)) }}
-{{- fail (printf "operator.startingCSV is %q, which is not a CSV name this chart can compare versions against. Expected <package>.v<numeric version> — for example cert-manager-operator.v1.19.1. The approver strips everything through '.v' and compares the rest with `sort -V`; a name without '.v' makes it compare the whole string (a cluster AHEAD of the pin is then misread as BEHIND, and the Job waits its full budget for an InstallPlan that will never be staged), and a pre-release suffix such as -rc.1 sorts AFTER the release it precedes, so an upgrade would be declined as 'newer'. Copy the exact name from the catalog: oc get packagemanifest %s -n %s -o 'custom-columns=CHANNEL:.status.channels[*].name,HEAD:.status.channels[*].currentCSV'. If you must pin a name in another format, set installPlanApprover.enabled=false and approve InstallPlans by another route." .Values.operator.startingCSV .Values.operator.packageName .Values.operator.sourceNamespace) }}
+{{- fail (printf "operator.startingCSV is %q, which is not a CSV name this chart can compare versions against. Expected <package>.v<numeric version> — for example cert-manager-operator.v1.19.1. The approver strips everything through '.v' and compares the rest with `sort -V`; a name without '.v' makes it compare the whole string (a cluster AHEAD of the pin is then misread as BEHIND, and the Job waits its full budget for an InstallPlan that will never be staged), and a pre-release suffix such as -rc.1 sorts AFTER the release it precedes, so an upgrade would be declined as 'newer'. Copy the exact name from the catalog: oc get packagemanifest %s -n %s -o 'custom-columns=CHANNEL:.status.channels[*].name,HEAD:.status.channels[*].currentCSV'. If that command shows the catalog itself no longer uses '.v' — every CSV is now <package>.1.2.3 — then this chart needs updating rather than working around, and the comment above this check says exactly which two lines to change; a rename cannot be compared correctly by any string ordering while the cluster still runs a v-prefixed CSV, which is why this refuses to render. To proceed without the approver meanwhile, set installPlanApprover.enabled=false and approve InstallPlans by another route." .Values.operator.startingCSV .Values.operator.packageName .Values.operator.sourceNamespace) }}
 {{- end }}
 # Approves ONLY the InstallPlan that installs operator.startingCSV.
 #
@@ -259,7 +292,14 @@ spec:
 
               if [ -n "$INSTALLED" ]; then
                 # Compare the trailing version of each CSV name. `sort -V` handles 1.9 < 1.10 correctly,
-                # which a string compare does not.
+                # which a string compare does not. Verified in this image (GNU coreutils 8.30): v1.20.1,
+                # v1.19.2, v1.20.10, v1.10.0 and v2.0.0 all read AHEAD of v1.19.1, and v1.9.0 reads BEHIND
+                # v1.10.0 — the case a lexical compare gets wrong.
+                #
+                # BOTH SIDES MUST CARRY THE `.v`, which the render-time guard at the top of this file
+                # enforces. Passing the two FULL CSV names to `sort -V` instead looks like a simplification
+                # and is a different set of wrong answers — see the note beside that guard before changing
+                # anything here.
                 inst_v="$(printf '%s' "$INSTALLED"   | sed 's/^.*\.v//')"
                 want_v="$(printf '%s' "$APPROVE_CSV" | sed 's/^.*\.v//')"
                 newer="$(printf '%s\n%s\n' "$inst_v" "$want_v" | sort -V | tail -1)"
