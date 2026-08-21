@@ -3,59 +3,56 @@
 {{- fail "installPlanApprover is enabled but operator.startingCSV is empty. The pin IS the approval authority — with nothing to match, the approver would either approve every InstallPlan the channel produces (defeating installPlanApproval: Manual) or approve none (hanging the install). Set operator.startingCSV, or set installPlanApprover.enabled=false and approve InstallPlans by another route." }}
 {{- end }}
 {{- /*
-     The pin's SHAPE is checked here, at render time, because the Job compares versions by stripping
-     everything through `.v` and handing the remainder to `sort -V`. Two malformed shapes make that
-     comparison lie, and both were found by probing the shipped logic in the operator's own image:
+     The pin's SHAPE is checked here, at render time, because a malformed pin fails in ways a log
+     cannot make obvious. Version COMPARISON survives both shapes below — the Job normalises each
+     side to its bare version (everything after the last `.v`, or after the first dot when no `.v`
+     exists) before ordering with `sort -V`, and all five mixed v/no-v orderings measured correct in
+     the Job's own image. What does NOT survive is APPROVAL: the search loop and the verify step
+     match operator.startingCSV against .spec.clusterServiceVersionNames and the CSV resource name
+     BYTE-FOR-BYTE, so a pin spelled differently from the catalog classifies correctly forever,
+     approves nothing, and burns the Job's whole budget instead of failing at render. Two shapes are
+     refused:
 
-       cert-manager-operator.1.19.1     no `.v`, so the sed does not match and the WHOLE name is
-                                        compared. A cluster ahead of the pin is then classified BEHIND,
-                                        and the Job waits its full 600s budget for an InstallPlan OLM
-                                        will never stage before failing — ten minutes late to a correct
-                                        conclusion.
+       cert-manager-operator.1.19.1     no `.v`. Every CSV this package has ever published is
+                                        <package>.v<version> (12 of 12 in the catalog), so a v-less
+                                        pin is a typo today — and a typo the search loop would pay
+                                        for in 600 wasted seconds instead of a render error.
        cert-manager-operator.v1.20.1-rc.1
-                                        `sort -V` is not semver-aware: it orders a pre-release AFTER the
-                                        release it precedes, so an rc installed against a final-release
-                                        pin reports "the cluster is NEWER" and declines to upgrade.
+                                        `sort -V` is not semver-aware: a pre-release orders AFTER
+                                        the release it precedes. Measured in the Job's image: an rc
+                                        PIN against its own installed final classifies BEHIND, so
+                                        the Job would hunt for an InstallPlan OLM will never stage
+                                        and burn its entire budget. No such CSV has ever been
+                                        published either.
 
-     Requiring a numeric-dotted version after `.v` rejects both. Every CSV this package has ever offered
-     is plain vX.Y.Z (12 of 12 in the catalog), so this rejects nothing real — and it fails during
-     `helm template`, before anything touches a cluster, rather than mid-install.
+     ── IF THE CATALOG ITSELF EVER DROPS THE `v` ──────────────────────────────────────────────────
 
-     ── IF THE CATALOG ITSELF EVER DROPS THE `v` ──────────────────────────────────────────────────────
+     The comparison side is already rename-proof, including the half-finished state where the
+     cluster runs v1.19.1 while the catalog offers 1.21.0 — bare numbers order that correctly, and
+     the same version spelled two ways is reported as installed, not as drift. The only edits needed
+     here: copy the exact new spelling from the catalog into operator.startingCSV, and relax the
+     regexMatch below to make the `v` optional. Do not relax it before the catalog actually renames —
+     the byte-for-byte argument above is version-independent. (An earlier note here prescribed
+     re-normalising both sides with a first-dot sed; superseded — and wrong for dotted package names,
+     turning my.pkg.v1.2.3 into pkg.v1.2.3 where the Job's last-`.v` split extracts 1.2.3.)
 
-     This guard is what makes that a LOUD failure instead of a wrong answer, and that is deliberate.
-     Measured in the same image: `sort -V` orders every v-less name before every v-ful one, so the `v`
-     dominates the comparison rather than the numbers —
+     DO NOT "SIMPLIFY" THE COMPARISON BY PASSING THE TWO FULL CSV NAMES TO sort -V. Measured in the
+     Job's image: `sort -V` orders every v-less name before every v-ful one, so the `v` dominates the
+     comparison rather than the numbers —
 
          cert-manager-operator.1.19.1      <- v-less first, whatever the version
          cert-manager-operator.1.21.0
          cert-manager-operator.v1.19.1     <- v-ful after, so 1.21.0 is judged OLDER than v1.19.1
          cert-manager-operator.v1.21.0
 
-     During any such rename the cluster is on `v1.19.1` while the catalog offers `1.21.0`, and NO string
-     comparison classifies that mixed pair correctly. Refusing to render is the only honest response.
-
-     THE FIX AT THAT POINT, so nobody has to rediscover it. Verified in this image against all 14 pairs
-     below — every v-ful, v-less and mixed ordering — before being written down:
-
-       1. Normalise both sides to bare numbers: `sed 's/^[^.]*\.v\?//'` in place of `sed 's/^.*\.v//'`.
-          The `[^.]*` is what makes it work; a greedy `.*` with an optional `v` backtracks to the LAST
-          dot and yields a single digit.
-       2. Compare the NORMALISED values for equality too, not the raw CSV names. Otherwise v1.19.1
-          installed against a 1.19.1 pin — the same version, spelled two ways, which is precisely what a
-          half-finished rename looks like — skips the equality branch and is classified AHEAD. Harmless
-          in effect (it approves nothing) but it reports the cluster as NEWER than an identical version.
-       3. Relax the regexMatch below to allow an optional `v`, and reword the error it throws: it
-          currently tells the reader to add a `.v`, which in that scenario is the wrong advice.
-
-     DO NOT "SIMPLIFY" THE COMPARISON BY DROPPING THE sed AND PASSING THE TWO FULL CSV NAMES TO sort -V.
-     It looks strictly better — no sed, no `v` assumption — and it is wrong in cases the current code
-     gets right. Measured on the five mixed v/no-v pairs: the shipped logic is wrong on three, the
-     full-name compare is wrong on two, including `v1.19.1` installed against a `1.21.0` pin, which it
-     calls AHEAD when the cluster is behind. It trades one set of wrong answers for another.
+     Measured on the five mixed pairs: the full-name compare is wrong on three — exactly as many as
+     the sed comparison this release replaced, because the two return opposite verdicts on every
+     ordering pair and both fail the same-version-two-spellings pair — including calling a cluster
+     that is BEHIND its pin AHEAD. It trades one set of wrong answers for its mirror image. Bare
+     numbers or nothing.
 */}}
 {{- if and .Values.operator.startingCSV (not (regexMatch "^.+\\.v[0-9]+(\\.[0-9]+)*$" .Values.operator.startingCSV)) }}
-{{- fail (printf "operator.startingCSV is %q, which is not a CSV name this chart can compare versions against. Expected <package>.v<numeric version> — for example cert-manager-operator.v1.19.1. The approver strips everything through '.v' and compares the rest with `sort -V`; a name without '.v' makes it compare the whole string (a cluster AHEAD of the pin is then misread as BEHIND, and the Job waits its full budget for an InstallPlan that will never be staged), and a pre-release suffix such as -rc.1 sorts AFTER the release it precedes, so an upgrade would be declined as 'newer'. Copy the exact name from the catalog: oc get packagemanifest %s -n %s -o 'custom-columns=CHANNEL:.status.channels[*].name,HEAD:.status.channels[*].currentCSV'. If that command shows the catalog itself no longer uses '.v' — every CSV is now <package>.1.2.3 — then this chart needs updating rather than working around, and the comment above this check says exactly which two lines to change; a rename cannot be compared correctly by any string ordering while the cluster still runs a v-prefixed CSV, which is why this refuses to render. To proceed without the approver meanwhile, set installPlanApprover.enabled=false and approve InstallPlans by another route." .Values.operator.startingCSV .Values.operator.packageName .Values.operator.sourceNamespace) }}
+{{- fail (printf "operator.startingCSV is %q, which is not a CSV name this chart can compare versions against. Expected <package>.v<numeric version> — for example cert-manager-operator.v1.19.1. The approver approves and verifies by matching this name byte-for-byte against what the catalog stages, so a spelling the catalog does not use approves nothing and the Job burns its whole budget waiting; and a pre-release suffix such as -rc.1 sorts AFTER the release it precedes under sort -V, so an rc pin against its own final classifies as an upgrade that can never arrive. Copy the exact name from the catalog: oc get packagemanifest %s -n %s -o 'custom-columns=CHANNEL:.status.channels[*].name,HEAD:.status.channels[*].currentCSV'. If that command shows the catalog itself no longer uses '.v' — every CSV is now <package>.1.2.3 — then this chart needs updating rather than working around, and the comment above this check says which regex to relax; the version comparison already handles a rename, but approval matches CSV names byte-for-byte, which is why an unexpected spelling refuses to render. To proceed without the approver meanwhile, set installPlanApprover.enabled=false and approve InstallPlans by another route." .Values.operator.startingCSV .Values.operator.packageName .Values.operator.sourceNamespace) }}
 {{- end }}
 # Approves ONLY the InstallPlan that installs operator.startingCSV.
 #
@@ -291,17 +288,43 @@ spec:
               fi
 
               if [ -n "$INSTALLED" ]; then
-                # Compare the trailing version of each CSV name. `sort -V` handles 1.9 < 1.10 correctly,
-                # which a string compare does not. Verified in this image (GNU coreutils 8.30): v1.20.1,
-                # v1.19.2, v1.20.10, v1.10.0 and v2.0.0 all read AHEAD of v1.19.1, and v1.9.0 reads BEHIND
-                # v1.10.0 — the case a lexical compare gets wrong.
+                # Bare version out of a CSV name: cert-manager-operator.v1.19.1 -> 1.19.1. Bash case and
+                # parameter expansion — no sed, no fork. The stripping is load-bearing, not cosmetic:
+                # measured in this image, `sort -V` orders EVERY v-less name before EVERY v-ful one, so on
+                # raw names the `v` outvotes the numbers — only bare versions compare honestly if the
+                # catalog ever drops its `v`.
                 #
-                # BOTH SIDES MUST CARRY THE `.v`, which the render-time guard at the top of this file
-                # enforces. Passing the two FULL CSV names to `sort -V` instead looks like a simplification
-                # and is a different set of wrong answers — see the note beside that guard before changing
-                # anything here.
-                inst_v="$(printf '%s' "$INSTALLED"   | sed 's/^.*\.v//')"
-                want_v="$(printf '%s' "$APPROVE_CSV" | sed 's/^.*\.v//')"
+                # The first branch splits at the LAST `.v` (## strips the longest prefix), so a dotted
+                # package name cannot bleed into the version. The v-less fallback can only anchor on the
+                # FIRST dot — right for every undotted package name. The guard at the top of this file
+                # refuses v-less PINS, but installedCSV is written by the cluster, out of any render-time
+                # check's reach, so here it has to be tolerated rather than rejected.
+                csv_version() {
+                  local ver
+                  case "$1" in
+                    *.v[0-9]*) printf '%s' "${1##*.v}" ;;
+                    *.*)       ver="${1#*.}"; printf '%s' "${ver#v}" ;;
+                    *)         printf '%s' "$1" ;;
+                  esac
+                }
+                inst_v="$(csv_version "$INSTALLED")"
+                want_v="$(csv_version "$APPROVE_CSV")"
+
+                if [ "$inst_v" = "$want_v" ]; then
+                  # Same version, spelled two ways — what a half-finished catalog rename looks like. On raw
+                  # names this skips the equality branch above and gets reported as the cluster being NEWER
+                  # than an identical version. Nothing to approve either way, but the pin still needs fixing
+                  # in git: the approve and verify steps below match CSV names byte-for-byte, so a pin
+                  # spelled differently from the catalog can classify forever yet never approve anything.
+                  log "already installed at version ${inst_v} — but the cluster spells it ${INSTALLED} and the pin spells it ${APPROVE_CSV}"
+                  log "  update operator.startingCSV to the exact spelling the cluster reports; approval matches CSV names byte-for-byte, so the spellings must agree before the next upgrade"
+                  report_unapproved_others
+                  exit 0
+                fi
+
+                # `sort -V` stays (GNU coreutils 8.30 in this image): 1.9 before 1.10 needs a version
+                # compare, not a string compare. Equality is settled above, so tail -1 is the strictly
+                # newer of the two.
                 newer="$(printf '%s\n%s\n' "$inst_v" "$want_v" | sort -V | tail -1)"
                 if [ "$newer" = "$inst_v" ]; then
                   # AHEAD. OLM does not downgrade, so no InstallPlan for the pin can ever appear. This is real
