@@ -187,6 +187,15 @@ spec:
               }
 
               # --- 2. already at the pin? --------------------------------------------------------------
+              # THREE CASES, not two. An earlier version tested only `installed == pin` and fell through to
+              # the search loop otherwise — so when the cluster was running a version the pin had been
+              # overtaken by, it hunted for an InstallPlan that OLM will never stage (there is no downgrade
+              # path) and burned its entire budget before failing with a message about the channel. Reported
+              # from a real 4.20 cluster: installedCSV=v1.20.0, pin=v1.19.1, six minutes of
+              # "waiting for OLM to stage an InstallPlan for v1.19.1".
+              #
+              # operator.startingCSV is OLM's STARTING point, not a ceiling — once the operator is past it,
+              # that version is history. So a mismatch has to be classified, not waited on.
               INSTALLED="$(oc get "$SUBS" "$SUBSCRIPTION" -n "$NAMESPACE" -o jsonpath='{.status.installedCSV}' 2>/dev/null || true)"
               if [ "$INSTALLED" = "$APPROVE_CSV" ]; then
                 log "already installed at ${APPROVE_CSV}; no InstallPlan to approve"
@@ -196,7 +205,40 @@ spec:
                 report_unapproved_others
                 exit 0
               fi
-              log "installedCSV=${INSTALLED:-<none yet>}"
+
+              if [ -n "$INSTALLED" ]; then
+                # Compare the trailing version of each CSV name. `sort -V` handles 1.9 < 1.10 correctly,
+                # which a string compare does not.
+                inst_v="$(printf '%s' "$INSTALLED"   | sed 's/^.*\.v//')"
+                want_v="$(printf '%s' "$APPROVE_CSV" | sed 's/^.*\.v//')"
+                newer="$(printf '%s\n%s\n' "$inst_v" "$want_v" | sort -V | tail -1)"
+                if [ "$newer" = "$inst_v" ]; then
+                  # AHEAD. OLM does not downgrade, so no InstallPlan for the pin can ever appear and waiting
+                  # is pointless. This is real drift — with installPlanApproval: Manual the operator cannot
+                  # have upgraded itself, so either a human approved a plan or the operator predates this
+                  # release adopting it. Fail immediately and say which, rather than after a long wait.
+                  fail "the cluster is running ${INSTALLED}, which is NEWER than operator.startingCSV (${APPROVE_CSV}).
+                OLM does not downgrade, so no InstallPlan for ${APPROVE_CSV} will ever be staged and waiting
+                for one is pointless — that pin describes a past state.
+
+                Almost always the fix is to adopt what is running, in git:
+                  operator.startingCSV: ${INSTALLED}
+                then re-run. The pin is what this chart declares should be running, and startingCSV is also
+                where OLM begins on a FRESH install — so it must name a version the channel still offers.
+
+                If you genuinely need ${APPROVE_CSV} instead, OLM cannot take you there: the CSV must be
+                removed and reinstalled, which takes cert-manager down. That is a deliberate act, not
+                something this Job will do for you.
+
+                What is installed:  oc get ${SUBS} ${SUBSCRIPTION} -n ${NAMESPACE} -o jsonpath='{.status.installedCSV}'
+                What is on offer:   oc get packagemanifest ${SUBSCRIPTION} -n {{ .Values.operator.sourceNamespace }} -o jsonpath='{range .status.channels[*]}{.name}{" -> "}{.currentCSV}{"\n"}{end}'"
+                fi
+                # BEHIND. The pin was moved forward in git and the cluster has not caught up — the normal
+                # upgrade path. OLM stages a plan for it and the loop below approves exactly that one.
+                log "installed ${INSTALLED} is older than the pin ${APPROVE_CSV} — this is an upgrade; waiting for OLM to stage it"
+              else
+                log "installedCSV=<none yet> — first install"
+              fi
 
               # --- 3. find the plan for the pinned CSV, owned by OUR Subscription ---------------------
               # Ownership matters: several operators can share a namespace, and approving another operator's

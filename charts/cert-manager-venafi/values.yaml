@@ -56,9 +56,24 @@ operator:
   # that, by approving ONLY the pinned version — so the version this chart declares
   # installs unattended and anything else waits for a person.
   installPlanApproval: Manual
-  # THE APPROVAL AUTHORITY. The approver approves an InstallPlan only if it installs
-  # exactly this CSV, so adopting a new version is a reviewable values change here
-  # rather than something OLM did overnight.
+  # TWO JOBS, ONE FIELD — worth understanding before you set it.
+  #
+  #   to OLM   `startingCSV` is where it BEGINS on a fresh install. It is a starting point,
+  #            NOT a ceiling: once the operator is installed, OLM offers newer versions along
+  #            the channel and this field stops constraining anything.
+  #   to this  the version this chart DECLARES should be running. The approver approves an
+  #   chart    InstallPlan only if it installs exactly this CSV, so moving version is a
+  #            reviewable change here rather than something OLM did overnight.
+  #
+  # Those two meanings agree on a fresh install and can DIVERGE afterwards — if the cluster
+  # ends up on a newer version (a human approved an upgrade, or the operator was already
+  # installed when this chart adopted it), this field is describing a past state. The approver
+  # detects that in seconds and tells you to adopt what is running, rather than waiting for an
+  # InstallPlan that OLM will never stage, because there is no downgrade path.
+  #
+  # So: SET THIS TO THE VERSION YOU WANT RUNNING, and keep it current. On a cluster whose
+  # catalog has moved on, that means the newer version — an OpenShift 4.20 catalog serves
+  # cert-manager-operator.v1.20.0 on stable-v1, where 4.18 serves v1.19.1.
   #
   # Note the CSV name does NOT begin with packageName — the package is
   # `openshift-cert-manager-operator` and the CSV is `cert-manager-operator.vX.Y.Z`.

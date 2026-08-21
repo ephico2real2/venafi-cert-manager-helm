@@ -135,7 +135,7 @@ ordinary resource, re-applies it every sync, and the **second** sync fails on th
 | `operator.source` | string | `redhat-operators` | CatalogSource name. |
 | `operator.sourceNamespace` | string | `openshift-marketplace` | CatalogSource namespace. |
 | `operator.installPlanApproval` | string | `Manual` | `Manual` pairs with `startingCSV` and the approver below: the pinned version installs unattended, anything else waits for a person. `Automatic` lets OLM install every InstallPlan the channel produces — on a rolling channel like `stable-v1` that means an unreviewed operator upgrade. |
-| `operator.startingCSV` | string | `cert-manager-operator.v1.19.1` | The pinned version, and the approver's authority — it approves an InstallPlan only if it installs exactly this CSV. Note the CSV name does not begin with `packageName`. To move version, bump this and upgrade. |
+| `operator.startingCSV` | string | `cert-manager-operator.v1.19.1` | **Set this to the version you want running, and keep it current.** It does two jobs: OLM uses it as the STARTING point on a fresh install (not a ceiling — OLM offers newer versions afterwards), and the approver treats it as the only version it will approve. Those diverge if the cluster ends up newer, in which case the approver fails in seconds telling you to adopt what is running — OLM cannot downgrade. A newer catalog serves a newer head: OpenShift 4.20 offers `v1.20.0` on `stable-v1` where 4.18 offers `v1.19.1`. Note the CSV name does not begin with `packageName`. |
 | `operator.upgradeStrategy` | string | `Default` | OperatorGroup upgrade strategy. |
 
 ### TPP credentials secret (authentication)
